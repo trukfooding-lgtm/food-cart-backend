@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
+const { installMerchantMap, expireStores } = require('../services/merchant_map');
+installMerchantMap(router);
 
 // ==========================================================
 // POST /api/merchants/register -> สมัครสมาชิกผู้ค้า
@@ -108,9 +110,14 @@ router.post('/login', async (req, res) => {
 // ==========================================================
 router.get('/trucks', async (req, res) => {
   try {
+    await expireStores();
     const { rows: merchants } = await pool.query(
-      `SELECT id, name, type, store_phone AS phone
-       FROM merchant`
+      `SELECT m.id, m.name, m.type, m.store_phone AS phone,
+         s.latitude, s.longitude,
+         CASE WHEN s.selling_ends_at > CURRENT_TIMESTAMP THEN s.status ELSE 'ปิดร้าน' END AS status,
+         TO_CHAR(h.open_time, 'HH24:MI') AS open_time, TO_CHAR(h.close_time, 'HH24:MI') AS close_time
+       FROM merchant m LEFT JOIN merchant_status s ON s.merchant_id=m.id
+       LEFT JOIN merchant_hours h ON h.merchant_id=m.id`
     );
 
     for (let i = 0; i < merchants.length; i++) {
@@ -530,6 +537,7 @@ router.put('/:id/prep-time', async (req, res) => {
 // ==========================================================
 router.get('/:id/status', async (req, res) => {
   try {
+    await expireStores();
     const { rows } = await pool.query(
       `SELECT status
        FROM merchant_status
@@ -559,57 +567,6 @@ router.get('/:id/status', async (req, res) => {
 // PUT /api/merchants/:id/status
 // บันทึกสถานะร้านค้า
 // ==========================================================
-router.put('/:id/status', async (req, res) => {
-  try {
-    const allowedStatuses = [
-      'เปิดร้าน',
-      'กำลังย้าย',
-      'ปิดร้าน'
-    ];
-
-    const { status } = req.body;
-
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: 'สถานะร้านไม่ถูกต้อง'
-      });
-    }
-
-    await pool.query(
-      `INSERT INTO merchant_status
-        (
-          merchant_id,
-          status
-        )
-       VALUES ($1, $2)
-
-       ON CONFLICT (merchant_id)
-
-       DO UPDATE SET
-         status = EXCLUDED.status`,
-      [
-        req.params.id,
-        status
-      ]
-    );
-
-    res.json({
-      success: true,
-      message: 'บันทึกสถานะร้านสำเร็จ'
-    });
-  } catch (error) {
-    console.error(
-      'Error saving merchant status:',
-      error
-    );
-
-    res.status(500).json({
-      success: false,
-      message: 'ไม่สามารถบันทึกสถานะร้านได้'
-    });
-  }
-});
 
 // ==========================================================
 // GET /api/merchants/:id/preferences
@@ -2201,6 +2158,24 @@ router.post(
       await connection.query(
         'BEGIN'
       );
+
+      // Serialize additions for this merchant before counting both payment types.
+      await connection.query(
+        'SELECT id FROM merchant WHERE id = $1 FOR UPDATE',
+        [req.params.id]
+      );
+      const accountCount = await connection.query(
+        'SELECT COUNT(*) AS total FROM merchant_bank_accounts WHERE merchant_id = $1',
+        [req.params.id]
+      );
+      if (Number(accountCount.rows[0].total) >= 2) {
+        await connection.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          code: 'BANK_ACCOUNT_LIMIT_REACHED',
+          message: 'คุณเพิ่มธนาคารเต็ม 2 บัญชีแล้ว'
+        });
+      }
 
       if (
         is_primary === true ||
