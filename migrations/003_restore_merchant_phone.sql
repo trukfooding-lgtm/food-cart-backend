@@ -1,0 +1,2 @@
+ALTER TABLE merchant
+  ADD COLUMN IF NOT EXISTS phone VARCHAR(20) NULL AFTER password;

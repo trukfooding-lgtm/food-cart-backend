@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS merchant_hours (
+  merchant_id INT NOT NULL,
+  open_everyday TINYINT(1) NOT NULL DEFAULT 1,
+  selected_days VARCHAR(50) NOT NULL DEFAULT 'จ,อ,พ,พฤ,ศ,ส,อา',
+  open_time TIME NOT NULL DEFAULT '08:00:00',
+  close_time TIME NOT NULL DEFAULT '18:00:00',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (merchant_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;

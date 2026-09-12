@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS merchant_sales_summary (
+  id INT NOT NULL AUTO_INCREMENT,
+  merchant_id INT NOT NULL,
+  sale_date DATE NOT NULL,
+  total_orders INT UNSIGNED NOT NULL DEFAULT 0,
+  total_sales DECIMAL(12,2) UNSIGNED NOT NULL DEFAULT 0.00,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_merchant_sales_date (merchant_id, sale_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
