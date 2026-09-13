@@ -23,7 +23,7 @@ function installMerchantMap(router) {
     } catch (e) { res.status(500).json({success:false, message:'โหลดจุดขายไม่สำเร็จ'}); }
   });
   router.put('/:id/status', async (req, res) => {
-    const {status, latitude, longitude, location_name} = req.body;
+    const {status, latitude, longitude, location_name, selling_started_at, selling_ends_at} = req.body;
     if (!['เปิดร้าน','กำลังย้าย','ปิดร้าน'].includes(status)) return res.status(400).json({success:false,message:'สถานะร้านไม่ถูกต้อง'});
     const hasPoint = latitude !== undefined || longitude !== undefined;
     if (hasPoint && (typeof latitude !== 'number' || typeof longitude !== 'number' || !Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude)>90 || Math.abs(longitude)>180)) return res.status(400).json({success:false,message:'พิกัดไม่ถูกต้อง'});
@@ -35,14 +35,21 @@ function installMerchantMap(router) {
       await client.query(`UPDATE merchant_status SET status='ปิดร้าน', updated_at=CURRENT_TIMESTAMP WHERE merchant_id=$1 AND selling_ends_at<=CURRENT_TIMESTAMP`,[req.params.id]);
       const {rows} = await client.query('SELECT * FROM merchant_status WHERE merchant_id=$1',[req.params.id]);
       const previous = rows[0];
-      let ends = previous?.selling_ends_at;
-      let starts = previous?.selling_started_at;
+      let ends = selling_ends_at ? new Date(selling_ends_at) : previous?.selling_ends_at;
+      let starts = selling_started_at ? new Date(selling_started_at) : previous?.selling_started_at;
+      const now = new Date();
+      if (status === 'เปิดร้าน' && (selling_started_at || selling_ends_at) &&
+          (!selling_started_at || !selling_ends_at || !Number.isFinite(starts.getTime()) ||
+            !Number.isFinite(ends.getTime()) || ends <= starts || ends <= now)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({success:false,message:'เวลาเริ่มและเวลาปิดรอบขายไม่ถูกต้อง'});
+      }
       if (status === 'เปิดร้าน') {
         if (!hasPoint && (previous?.latitude == null || previous?.longitude == null)) {
           await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาปักหมุดจุดขายก่อนเปิดร้าน'});
         }
         // Moving the pin never extends the current selling session.
-        if (!previous || previous.status === 'ปิดร้าน' || !ends || new Date(ends) <= new Date()) {
+        if (!selling_started_at && (!previous || previous.status === 'ปิดร้าน' || !ends || new Date(ends) <= now)) {
           const schedule = await client.query(`SELECT
             CASE WHEN close_time > open_time THEN
               ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date + close_time) AT TIME ZONE 'Asia/Bangkok'
@@ -55,22 +62,30 @@ function installMerchantMap(router) {
           if (!ends || new Date(ends) <= new Date()) {
             await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาตั้งเวลาเปิด–ปิดร้านให้ครอบคลุมเวลาขายปัจจุบัน'});
           }
-          starts = new Date();
+          starts = now;
         }
       } else if (status === 'กำลังย้าย' && (!previous || previous.status === 'ปิดร้าน' || !ends)) {
         await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาปักหมุดเปิดร้านก่อนเปลี่ยนเป็นกำลังย้าย'});
       }
+      const scheduled = status === 'เปิดร้าน' && starts > now;
+      const effectiveStatus = scheduled ? 'ปิดร้าน' : status;
       await client.query(`INSERT INTO merchant_status (merchant_id,status,latitude,longitude,location_name,selling_started_at,selling_ends_at,updated_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP)
         ON CONFLICT (merchant_id) DO UPDATE SET status=EXCLUDED.status,latitude=EXCLUDED.latitude,
         longitude=EXCLUDED.longitude,location_name=EXCLUDED.location_name,selling_started_at=EXCLUDED.selling_started_at,
         selling_ends_at=EXCLUDED.selling_ends_at,updated_at=CURRENT_TIMESTAMP`,
-        [req.params.id,status,status==='เปิดร้าน'&&hasPoint?latitude:previous?.latitude??null,
+        [req.params.id,effectiveStatus,status==='เปิดร้าน'&&hasPoint?latitude:previous?.latitude??null,
           status==='เปิดร้าน'&&hasPoint?longitude:previous?.longitude??null,
           status==='เปิดร้าน'&&hasPoint?String(location_name||'จุดขาย'):previous?.location_name??null,
           starts??null,status==='ปิดร้าน'?null:ends]);
+      if (status === 'เปิดร้าน' && !scheduled) {
+        await client.query(`INSERT INTO notifications (user_id,title,body)
+          SELECT DISTINCT customer_id, $2, $3 FROM followed WHERE merchant_id = $1`,
+          [req.params.id, 'ร้านรถเข็นที่คุณติดตามเปิดขายแล้ว',
+            `ร้าน ${merchant.rows[0]?.name || ''} เปิดขายแล้วนะ 📍 อยู่ที่ ${location_name || previous?.location_name || 'จุดขาย'}`]);
+      }
       await client.query('COMMIT');
-      res.json({success:true,status,message:'บันทึกสถานะร้านสำเร็จ'});
+      res.json({success:true,status:effectiveStatus,scheduled_open:scheduled,message:'บันทึกรอบขายสำเร็จ'});
     } catch(e) { await client.query('ROLLBACK'); res.status(500).json({success:false,message:'บันทึกจุดขายไม่สำเร็จ'}); }
     finally { client.release(); }
   });
