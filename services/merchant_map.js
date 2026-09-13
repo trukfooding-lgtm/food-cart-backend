@@ -1,6 +1,7 @@
 const { pool } = require('../config/db');
 async function expireStores() {
-  await pool.query('SELECT public.process_merchant_selling_sessions()');
+  await pool.query(`UPDATE merchant_status SET status = 'ปิดร้าน', updated_at = CURRENT_TIMESTAMP
+    WHERE status <> 'ปิดร้าน' AND selling_ends_at <= CURRENT_TIMESTAMP`);
 }
 function installMerchantMap(router) {
   router.get('/map-pins', async (req, res) => {
@@ -22,60 +23,54 @@ function installMerchantMap(router) {
     } catch (e) { res.status(500).json({success:false, message:'โหลดจุดขายไม่สำเร็จ'}); }
   });
   router.put('/:id/status', async (req, res) => {
-    const {status, latitude, longitude, location_name, selling_started_at, selling_ends_at} = req.body;
-    const explicitTimes = selling_started_at !== undefined || selling_ends_at !== undefined;
+    const {status, latitude, longitude, location_name} = req.body;
     if (!['เปิดร้าน','กำลังย้าย','ปิดร้าน'].includes(status)) return res.status(400).json({success:false,message:'สถานะร้านไม่ถูกต้อง'});
     const hasPoint = latitude !== undefined || longitude !== undefined;
     if (hasPoint && (typeof latitude !== 'number' || typeof longitude !== 'number' || !Number.isFinite(latitude) || !Number.isFinite(longitude) || Math.abs(latitude)>90 || Math.abs(longitude)>180)) return res.status(400).json({success:false,message:'พิกัดไม่ถูกต้อง'});
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const merchant = await client.query('SELECT id, name FROM merchant WHERE id=$1 FOR UPDATE',[req.params.id]);
+      const merchant = await client.query('SELECT id FROM merchant WHERE id=$1 FOR UPDATE',[req.params.id]);
       if (!merchant.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({success:false,message:'ไม่พบร้านค้า'}); }
       await client.query(`UPDATE merchant_status SET status='ปิดร้าน', updated_at=CURRENT_TIMESTAMP WHERE merchant_id=$1 AND selling_ends_at<=CURRENT_TIMESTAMP`,[req.params.id]);
       const {rows} = await client.query('SELECT * FROM merchant_status WHERE merchant_id=$1',[req.params.id]);
       const previous = rows[0];
       let ends = previous?.selling_ends_at;
       let starts = previous?.selling_started_at;
-      const now = new Date();
-      let notify = false;
-      let pending = false;
-      let savedStatus = status;
       if (status === 'เปิดร้าน') {
         if (!hasPoint && (previous?.latitude == null || previous?.longitude == null)) {
           await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาปักหมุดจุดขายก่อนเปิดร้าน'});
         }
-        if (explicitTimes) {
-          starts = new Date(selling_started_at);
-          ends = new Date(selling_ends_at);
-          if (typeof selling_started_at !== 'string' || typeof selling_ends_at !== 'string' ||
-              !/(Z|[+-]\d{2}:\d{2})$/.test(selling_started_at) || !/(Z|[+-]\d{2}:\d{2})$/.test(selling_ends_at) ||
-              !Number.isFinite(starts.getTime()) || !Number.isFinite(ends.getTime()) || ends <= starts || ends <= now) {
-            await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาระบุเวลาเริ่มและเวลาปิดรอบขายให้ถูกต้อง'});
+        // Moving the pin never extends the current selling session.
+        if (!previous || previous.status === 'ปิดร้าน' || !ends || new Date(ends) <= new Date()) {
+          const schedule = await client.query(`SELECT
+            CASE WHEN close_time > open_time THEN
+              ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date + close_time) AT TIME ZONE 'Asia/Bangkok'
+            ELSE
+              ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date + close_time +
+                CASE WHEN (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::time >= open_time THEN INTERVAL '1 day' ELSE INTERVAL '0 day' END)
+              AT TIME ZONE 'Asia/Bangkok' END AS ends_at
+            FROM merchant_hours WHERE merchant_id=$1`,[req.params.id]);
+          ends = schedule.rows[0]?.ends_at;
+          if (!ends || new Date(ends) <= new Date()) {
+            await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาตั้งเวลาเปิด–ปิดร้านให้ครอบคลุมเวลาขายปัจจุบัน'});
           }
-        } else if (!starts || !ends || new Date(ends) <= now || previous?.status === 'ปิดร้าน') {
-          await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาเลือกเวลาเริ่มขายและเวลาปิดตอนปักหมุด'});
+          starts = new Date();
         }
-        pending = new Date(starts) > now;
-        savedStatus = pending ? 'ปิดร้าน' : 'เปิดร้าน';
-        const pointChanged = hasPoint && (Number(previous?.latitude) !== latitude || Number(previous?.longitude) !== longitude);
-        notify = !previous || previous.status !== 'เปิดร้าน' || pointChanged ||
-          new Date(previous.selling_started_at).getTime() !== new Date(starts).getTime();
-      } else if (status === 'กำลังย้าย' && (!previous || previous.status === 'ปิดร้าน' || !ends || new Date(ends) <= now)) {
-        await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาเปิดรอบขายก่อนเปลี่ยนเป็นกำลังย้าย'});
+      } else if (status === 'กำลังย้าย' && (!previous || previous.status === 'ปิดร้าน' || !ends)) {
+        await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาปักหมุดเปิดร้านก่อนเปลี่ยนเป็นกำลังย้าย'});
       }
-      await client.query(`INSERT INTO merchant_status (merchant_id,status,latitude,longitude,location_name,selling_started_at,selling_ends_at,scheduled_open,opening_notified,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP)
+      await client.query(`INSERT INTO merchant_status (merchant_id,status,latitude,longitude,location_name,selling_started_at,selling_ends_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP)
         ON CONFLICT (merchant_id) DO UPDATE SET status=EXCLUDED.status,latitude=EXCLUDED.latitude,
         longitude=EXCLUDED.longitude,location_name=EXCLUDED.location_name,selling_started_at=EXCLUDED.selling_started_at,
-        selling_ends_at=EXCLUDED.selling_ends_at,scheduled_open=EXCLUDED.scheduled_open,opening_notified=EXCLUDED.opening_notified,updated_at=CURRENT_TIMESTAMP`,
-        [req.params.id,savedStatus,status==='เปิดร้าน'&&hasPoint?latitude:previous?.latitude??null,
+        selling_ends_at=EXCLUDED.selling_ends_at,updated_at=CURRENT_TIMESTAMP`,
+        [req.params.id,status,status==='เปิดร้าน'&&hasPoint?latitude:previous?.latitude??null,
           status==='เปิดร้าน'&&hasPoint?longitude:previous?.longitude??null,
           status==='เปิดร้าน'&&hasPoint?String(location_name||'จุดขาย'):previous?.location_name??null,
-          starts??null,status==='ปิดร้าน'?null:ends,pending, status==='เปิดร้าน' ? !notify && !pending : true]);
-      await client.query('SELECT public.process_merchant_selling_sessions()');
+          starts??null,status==='ปิดร้าน'?null:ends]);
       await client.query('COMMIT');
-      res.json({success:true,status:savedStatus,scheduled_open:pending,message:'บันทึกรอบขายสำเร็จ'});
+      res.json({success:true,status,message:'บันทึกสถานะร้านสำเร็จ'});
     } catch(e) { await client.query('ROLLBACK'); res.status(500).json({success:false,message:'บันทึกจุดขายไม่สำเร็จ'}); }
     finally { client.release(); }
   });

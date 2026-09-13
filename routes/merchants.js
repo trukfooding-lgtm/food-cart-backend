@@ -114,7 +114,7 @@ router.get('/trucks', async (req, res) => {
     const { rows: merchants } = await pool.query(
       `SELECT m.id, m.name, m.type, m.store_phone AS phone,
          s.latitude, s.longitude,
-         CASE WHEN s.selling_started_at <= CURRENT_TIMESTAMP AND s.selling_ends_at > CURRENT_TIMESTAMP THEN s.status ELSE 'ปิดร้าน' END AS status,
+         CASE WHEN s.selling_ends_at > CURRENT_TIMESTAMP THEN s.status ELSE 'ปิดร้าน' END AS status,
          TO_CHAR(h.open_time, 'HH24:MI') AS open_time, TO_CHAR(h.close_time, 'HH24:MI') AS close_time
        FROM merchant m LEFT JOIN merchant_status s ON s.merchant_id=m.id
        LEFT JOIN merchant_hours h ON h.merchant_id=m.id`
@@ -353,8 +353,7 @@ router.get('/:id/hours', async (req, res) => {
          open_everyday,
          selected_days,
          TO_CHAR(open_time, 'HH24:MI') AS open_time,
-         TO_CHAR(close_time, 'HH24:MI') AS close_time,
-         weekly_hours
+         TO_CHAR(close_time, 'HH24:MI') AS close_time
        FROM merchant_hours
        WHERE merchant_id = $1`,
       [req.params.id]
@@ -387,8 +386,7 @@ router.put('/:id/hours', async (req, res) => {
       open_everyday,
       selected_days,
       open_time,
-      close_time,
-      weekly_hours
+      close_time
     } = req.body;
 
     if (
@@ -402,14 +400,6 @@ router.put('/:id/hours', async (req, res) => {
       });
     }
 
-    const days = ['จ','อ','พ','พฤ','ศ','ส','อา'];
-    const validTime = value => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
-    if (!validTime(open_time) || !validTime(close_time) || selected_days.some(d => !days.includes(d)) ||
-        (weekly_hours !== undefined && (weekly_hours === null || Array.isArray(weekly_hours) || typeof weekly_hours !== 'object' ||
-          Object.entries(weekly_hours).some(([day, hours]) => !days.includes(day) || !hours ||
-            !validTime(hours.open_time) || !validTime(hours.close_time) || hours.open_time === hours.close_time)))) {
-      return res.status(400).json({success:false,message:'วันหรือเวลาทำการไม่ถูกต้อง'});
-    }
     await pool.query(
       `INSERT INTO merchant_hours
         (
@@ -417,9 +407,9 @@ router.put('/:id/hours', async (req, res) => {
           open_everyday,
           selected_days,
           open_time,
-          close_time, weekly_hours
+          close_time
         )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       VALUES ($1, $2, $3, $4, $5)
 
        ON CONFLICT (merchant_id)
 
@@ -427,14 +417,13 @@ router.put('/:id/hours', async (req, res) => {
          open_everyday = EXCLUDED.open_everyday,
          selected_days = EXCLUDED.selected_days,
          open_time = EXCLUDED.open_time,
-         close_time = EXCLUDED.close_time, weekly_hours = EXCLUDED.weekly_hours`,
+         close_time = EXCLUDED.close_time`,
       [
         req.params.id,
         open_everyday ? 1 : 0,
         selected_days.join(','),
         open_time,
-        close_time,
-        weekly_hours === undefined ? null : JSON.stringify(weekly_hours)
+        close_time
       ]
     );
 
