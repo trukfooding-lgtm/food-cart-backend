@@ -28,10 +28,11 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    await pool.query(
+    const { rows: created } = await pool.query(
       `INSERT INTO merchant
         (name, email, password, store_phone, type)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
       [
         name,
         email,
@@ -43,6 +44,7 @@ router.post('/register', async (req, res) => {
 
     res.status(201).json({
       success: true,
+      merchant_id: created[0].id,
       message: 'สมัครสมาชิกผู้ค้าสำเร็จ'
     });
   } catch (err) {
