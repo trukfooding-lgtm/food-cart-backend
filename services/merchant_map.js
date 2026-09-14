@@ -2,6 +2,9 @@ const { pool } = require('../config/db');
 async function expireStores() {
   await pool.query(`UPDATE merchant_status SET status = 'ปิดร้าน', updated_at = CURRENT_TIMESTAMP
     WHERE status <> 'ปิดร้าน' AND selling_ends_at <= CURRENT_TIMESTAMP`);
+  await pool.query(`UPDATE merchant_status SET status = 'เปิดร้าน', updated_at = CURRENT_TIMESTAMP
+    WHERE status = 'ปิดร้าน' AND selling_started_at <= CURRENT_TIMESTAMP
+      AND selling_ends_at > CURRENT_TIMESTAMP`);
 }
 function installMerchantMap(router) {
   router.get('/map-pins', async (req, res) => {
