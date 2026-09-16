@@ -91,6 +91,7 @@ router.post('/login', async (req, res) => {
     }
 
     delete merchant.password;
+    delete merchant.fcm_token;
 
     res.json({
       success: true,
@@ -102,6 +103,48 @@ router.post('/login', async (req, res) => {
       success: false,
       message: 'เกิดข้อผิดพลาด',
       error: err.message
+    });
+  }
+});
+
+// ==========================================================
+// POST /api/merchants/:id/fcm-token
+// บันทึกอุปกรณ์ที่ใช้รับ Push Notification ของร้านค้า
+// ==========================================================
+router.post('/:id/fcm-token', async (req, res) => {
+  const { fcm_token: fcmToken } = req.body;
+
+  if (!fcmToken) {
+    return res.status(400).json({
+      success: false,
+      message: 'กรุณาระบุ FCM Token'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE merchant
+       SET fcm_token = $1
+       WHERE id = $2`,
+      [fcmToken, req.params.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบร้านค้านี้'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'บันทึก FCM Token ของร้านค้าเรียบร้อย'
+    });
+  } catch (error) {
+    console.error('Error saving merchant FCM Token:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถบันทึก FCM Token ของร้านค้าได้'
     });
   }
 });
