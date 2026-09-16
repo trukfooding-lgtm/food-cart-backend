@@ -83,15 +83,9 @@ function integerId(value) {
   return /^\d+$/.test(String(value)) ? Number(value) : null;
 }
 
-function ensureActor(req, type, id) {
-  return req.actor && req.actor.type === type && String(req.actor.id) === String(id);
-}
-
-function objectPath(type, actorId, orderId, file) {
+function objectPath(actorId, orderId, file) {
   const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
-  return type === 'CUSTOMER'
-    ? `customers/${actorId}/orders/${orderId}/${randomUUID()}${ext}`
-    : `merchants/${actorId}/refunds/${orderId}/${randomUUID()}${ext}`;
+  return `customers/${actorId}/orders/${orderId}/${randomUUID()}${ext}`;
 }
 
 async function orderForActor(orderId, actor) {
@@ -106,52 +100,9 @@ async function orderForActor(orderId, actor) {
   return order;
 }
 
-router.get('/customers/:customerId/bank-accounts', requireAccessToken, async (req, res) => {
-  const customerId = integerId(req.params.customerId);
-  if (!customerId || !ensureActor(req, 'CUSTOMER', customerId)) {
-    return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์ดูข้อมูลนี้' });
-  }
-
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, customer_id, payment_type, bank_code, account_name,
-              account_number, promptpay_type, promptpay_id, receiver_name,
-              is_primary, is_verified, created_at, updated_at
-       FROM customer_bank_accounts
-       WHERE customer_id = $1
-       ORDER BY is_primary DESC, id ASC`,
-      [customerId]
-    );
-    res.json({ success: true, accounts: rows });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'ดึงบัญชีไม่สำเร็จ' });
-  }
-});
-
-router.put('/customers/:customerId/bank-accounts/:accountId/primary', requireAccessToken, async (req, res) => {
-  const customerId = integerId(req.params.customerId);
-  const accountId = integerId(req.params.accountId);
-  if (!customerId || !accountId || !ensureActor(req, 'CUSTOMER', customerId)) {
-    return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์แก้ไขข้อมูลนี้' });
-  }
-
-  try {
-    const result = await pool.query(
-      `UPDATE customer_bank_accounts
-       SET is_primary = TRUE, updated_at = NOW()
-       WHERE customer_id = $1 AND id = $2`,
-      [customerId, accountId]
-    );
-    if (!result.rowCount) return res.status(404).json({ success: false, message: 'ไม่พบบัญชี' });
-    res.json({ success: true, message: 'ตั้งเป็นบัญชีหลักแล้ว' });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'อัปเดตบัญชีไม่สำเร็จ' });
-  }
-});
-
-async function saveSlip(req, res, type) {
+async function saveSlip(req, res) {
   const orderId = integerId(req.params.orderId);
-  if (!orderId || !req.actor || !['CUSTOMER', 'MERCHANT'].includes(type)) {
+  if (!orderId || !req.actor || req.actor.type !== 'CUSTOMER') {
     return res.status(400).json({ success: false, message: 'ข้อมูลไม่ถูกต้อง' });
   }
   const order = await orderForActor(orderId, req.actor);
@@ -165,16 +116,15 @@ async function saveSlip(req, res, type) {
     return res.status(400).json({ success: false, message: 'จำนวนเงินไม่ถูกต้อง' });
   }
 
-  const objectPathValue = objectPath(type, req.actor.id, orderId, req.file);
+  const objectPathValue = objectPath(req.actor.id, orderId, req.file);
   await uploadToStorage(req.file, objectPathValue);
 
-  const note = type === 'MERCHANT' ? (req.body.note || 'คืนเงินลูกค้า') : (req.body.note || null);
   const { rows } = await pool.query(
     `INSERT INTO order_slips
        (order_id, uploader_type, uploader_id, slip_url, amount, transfer_time, note)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     VALUES ($1, 'CUSTOMER', $2, $3, $4, $5, $6)
      RETURNING id, order_id, uploader_type, uploader_id, amount, transfer_time, status, note, created_at`,
-    [String(orderId), type, Number(req.actor.id), objectPathValue, amount, req.body.transfer_time || null, note]
+    [String(orderId), Number(req.actor.id), objectPathValue, amount, req.body.transfer_time || null, req.body.note || null]
   );
 
   res.status(201).json({ success: true, slip: rows[0] });
@@ -182,17 +132,7 @@ async function saveSlip(req, res, type) {
 
 router.post('/orders/:orderId/payment-slip', requireAccessToken, upload.single('slip'), async (req, res) => {
   try {
-    if (req.actor.type !== 'CUSTOMER') return res.status(403).json({ success: false, message: 'เฉพาะลูกค้าเท่านั้น' });
-    await saveSlip(req, res, 'CUSTOMER');
-  } catch (error) {
-    res.status(error.status || 500).json({ success: false, message: error.message || 'บันทึกสลิปไม่สำเร็จ' });
-  }
-});
-
-router.post('/orders/:orderId/refund-slip', requireAccessToken, upload.single('slip'), async (req, res) => {
-  try {
-    if (req.actor.type !== 'MERCHANT') return res.status(403).json({ success: false, message: 'เฉพาะร้านค้าเท่านั้น' });
-    await saveSlip(req, res, 'MERCHANT');
+    await saveSlip(req, res);
   } catch (error) {
     res.status(error.status || 500).json({ success: false, message: error.message || 'บันทึกสลิปไม่สำเร็จ' });
   }
