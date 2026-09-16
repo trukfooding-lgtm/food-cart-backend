@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
+const { sendMerchantNotification } = require('../services/merchant_push_notification');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -127,6 +128,17 @@ router.post('/create', async (req, res) => {
         ]
       );
     }
+
+    sendMerchantNotification({
+      merchantId: mId,
+      sourceType: 'order',
+      sourceId: newOrderId,
+      title: 'มีออเดอร์ใหม่',
+      message: `ออเดอร์ #${newOrderId} ยอดรวม ${total_price} บาท`,
+      data: {
+        order_id: newOrderId
+      }
+    });
 
     await sendPushNotification(
       customer_id,
@@ -360,7 +372,7 @@ router.post('/review', async (req, res) => {
   } = req.body;
 
   try {
-    await pool.query(
+    const { rows: reviews } = await pool.query(
       `INSERT INTO reviews
        (
          order_id,
@@ -370,7 +382,8 @@ router.post('/review', async (req, res) => {
          comment,
          images
        )
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
       [
         order_id,
         merchant_id,
@@ -380,6 +393,17 @@ router.post('/review', async (req, res) => {
         JSON.stringify(images),
       ]
     );
+
+    sendMerchantNotification({
+      merchantId: merchant_id,
+      sourceType: 'review',
+      sourceId: reviews[0].id,
+      title: 'มีรีวิวใหม่',
+      message: `ลูกค้าให้คะแนน ${rating} ดาว`,
+      data: {
+        order_id
+      }
+    });
 
     await pool.query(
       `UPDATE orders
