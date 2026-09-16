@@ -180,7 +180,6 @@ router.get(
           ) AS merchant_name,
           o.total_price,
           o.status,
-          o.refund_status,
           o.created_at,
           oi.item_name,
           oi.quantity,
@@ -217,8 +216,6 @@ router.get(
             total_price:
               row.total_price,
             status: row.status,
-            refund_status:
-              row.refund_status,
             created_at:
               row.created_at,
             ratingScore:
