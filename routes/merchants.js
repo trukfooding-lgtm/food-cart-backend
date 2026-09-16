@@ -1541,7 +1541,7 @@ router.get('/:id/orders', async (req, res) => {
 
 // ==========================================================
 // PUT /api/merchants/:id/orders/:orderId/status
-// อัปเดตสถานะเฉพาะฝั่งร้าน
+// อัปเดตสถานะฝั่งร้านและลูกค้าให้ตรงกัน
 // ==========================================================
 router.put(
   '/:id/orders/:orderId/status',
@@ -1557,6 +1557,12 @@ router.put(
       prep_minutes,
       reject_reason
     } = req.body;
+
+    const customerStatusByMerchantStatus = {
+      'กำลังปรุง': 'รอชำระเงิน',
+      'รอรับสินค้า': 'พร้อมรับ',
+      'ยกเลิก': 'ยกเลิก'
+    };
 
     if (
       !allowedStatuses.includes(
@@ -1583,9 +1589,14 @@ router.put(
       });
     }
 
+    let connection;
+
     try {
+      connection = await pool.connect();
+      await connection.query('BEGIN');
+
       const result =
-        await pool.query(
+        await connection.query(
           `UPDATE merchant_orders
 
            SET
@@ -1629,6 +1640,7 @@ router.put(
       if (
         result.rowCount === 0
       ) {
+        await connection.query('ROLLBACK');
         return res.status(404).json({
           success: false,
           message:
@@ -1636,10 +1648,49 @@ router.put(
         });
       }
 
+      const customerStatus =
+        customerStatusByMerchantStatus[
+          status
+        ];
+
+      const customerOrderResult =
+        await connection.query(
+          `UPDATE orders
+           SET status = $1
+           WHERE id = $2
+             AND merchant_id = $3`,
+          [
+            customerStatus,
+            req.params.orderId,
+            req.params.id
+          ]
+        );
+
+      if (
+        customerOrderResult.rowCount === 0
+      ) {
+        await connection.query('ROLLBACK');
+        return res.status(404).json({
+          success: false,
+          message:
+            'ไม่พบออเดอร์ฝั่งลูกค้า'
+        });
+      }
+
+      await connection.query('COMMIT');
+
       res.json({
-        success: true
+        success: true,
+        merchant_status: status,
+        customer_status: customerStatus
       });
     } catch (error) {
+      if (connection) {
+        try {
+          await connection.query('ROLLBACK');
+        } catch (_) {}
+      }
+
       console.error(
         'Error updating merchant order:',
         error
@@ -1650,6 +1701,8 @@ router.put(
         message:
           'ไม่สามารถอัปเดตออเดอร์ได้'
       });
+    } finally {
+      connection?.release();
     }
   }
 );
