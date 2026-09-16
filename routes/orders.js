@@ -298,6 +298,101 @@ router.get('/:id', async (req, res) => {
 });
 
 // ==========================================================
+// PUT /api/orders/:id/cancel
+// ยกเลิกคำสั่งซื้อโดยลูกค้าและซิงก์สถานะไปฝั่งร้านค้า
+// ==========================================================
+router.put('/:id/cancel', async (req, res) => {
+  const orderId = req.params.id;
+  const reason = String(req.body?.reason || 'ลูกค้าขอยกเลิกคำสั่งซื้อ').trim();
+  let connection;
+
+  try {
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+
+    const { rows: orders } = await connection.query(
+      `SELECT id, merchant_id, status
+       FROM orders
+       WHERE id = $1
+       FOR UPDATE`,
+      [orderId]
+    );
+
+    if (orders.length === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์นี้'
+      });
+    }
+
+    const order = orders[0];
+    const nonCancellableStatuses = [
+      'PAID',
+      'ชำระเงินแล้ว',
+      'กำลังปรุง',
+      'พร้อมรับ',
+      'รอรับสินค้า',
+      'รับอาหารสำเร็จแล้ว',
+      'สำเร็จ'
+    ];
+
+    if (nonCancellableStatuses.includes(order.status)) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'ไม่สามารถยกเลิกออเดอร์ที่กำลังดำเนินการหรือชำระเงินแล้วได้'
+      });
+    }
+
+    const merchantResult = await connection.query(
+      `UPDATE merchant_orders
+       SET merchant_status = 'ยกเลิก',
+           reject_reason = $1,
+           rejected_at = NOW()
+       WHERE source_order_id = $2
+         AND merchant_id = $3`,
+      [reason || 'ลูกค้าขอยกเลิกคำสั่งซื้อ', orderId, order.merchant_id]
+    );
+
+    if (merchantResult.rowCount === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์ฝั่งร้านค้า'
+      });
+    }
+
+    await connection.query(
+      `UPDATE orders
+       SET status = 'ยกเลิก'
+       WHERE id = $1`,
+      [orderId]
+    );
+
+    await connection.query('COMMIT');
+
+    res.json({
+      success: true,
+      status: 'ยกเลิก',
+      message: 'ยกเลิกออเดอร์และซิงก์สถานะไปฝั่งร้านค้าสำเร็จ'
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.query('ROLLBACK');
+    }
+
+    console.error('Error cancelling order:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถยกเลิกออเดอร์ได้'
+    });
+  } finally {
+    connection?.release();
+  }
+});
+
+// ==========================================================
 // 4. PUT /api/orders/:id/complete
 // ==========================================================
 router.put(
