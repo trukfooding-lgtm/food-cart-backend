@@ -1314,6 +1314,7 @@ router.get(
           `SELECT
              id,
              source_type,
+             source_id,
              title,
              message,
              event_at
