@@ -1527,19 +1527,44 @@ router.get('/:id/orders', async (req, res) => {
       [req.params.id]
     );
 
+    // ดึงจาก orders เป็นแหล่งข้อมูลหลักด้วย เพื่อไม่ให้ออเดอร์หาย
+    // หากรายการใน merchant_orders (ตารางสำเนาเพื่อเก็บสถานะร้าน) ยังไม่ทันถูกสร้าง
     const { rows } =
       await pool.query(
         `SELECT
-           mo.source_order_id AS order_id,
-           mo.customer_id,
-           mo.customer_name,
-           mo.items_summary,
-           mo.total_price,
-           mo.merchant_status,
+           o.id AS order_id,
+           o.customer_id,
+           COALESCE(
+             NULLIF(mo.customer_name, ''),
+             NULLIF(c.name_surname, ''),
+             c.username,
+             'ไม่ระบุชื่อลูกค้า'
+           ) AS customer_name,
+           COALESCE(
+             NULLIF(mo.items_summary, ''),
+             (
+               SELECT STRING_AGG(
+                 oi.item_name || ' x' || oi.quantity::text,
+                 ', ' ORDER BY oi.id
+               )
+               FROM order_items oi
+               WHERE oi.order_id = o.id
+             ),
+             '-'
+           ) AS items_summary,
+           o.total_price,
+           COALESCE(
+             mo.merchant_status,
+             CASE
+               WHEN o.status = 'รับอาหารสำเร็จแล้ว' THEN 'เสร็จสิ้น'
+               WHEN o.status IN ('ปฏิเสธ', 'ยกเลิก') THEN 'ยกเลิก'
+               ELSE 'ใหม่'
+             END
+           ) AS merchant_status,
            mo.prep_minutes,
            mo.reject_reason,
            mo.rejected_at,
-           mo.ordered_at,
+           COALESCE(mo.ordered_at, o.created_at) AS ordered_at,
            o.status AS customer_order_status,
            o.transaction_id,
            CASE
@@ -1572,15 +1597,18 @@ router.get('/:id/orders', async (req, res) => {
              ELSE NULL
            END AS payment_deadline
 
-         FROM merchant_orders mo
+         FROM orders o
 
-         LEFT JOIN orders o
+         LEFT JOIN customer c
+           ON c.customer_id = o.customer_id
+
+         LEFT JOIN merchant_orders mo
            ON o.id = mo.source_order_id
           AND o.merchant_id = mo.merchant_id
 
-         WHERE mo.merchant_id = $1
+         WHERE o.merchant_id = $1
 
-         ORDER BY mo.ordered_at DESC`,
+         ORDER BY COALESCE(mo.ordered_at, o.created_at) DESC`,
         [req.params.id]
       );
 
