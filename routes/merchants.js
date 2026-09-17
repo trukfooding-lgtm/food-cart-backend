@@ -8,30 +8,123 @@ installMerchantMap(router);
 // POST /api/merchants/register -> สมัครสมาชิกผู้ค้า
 // ==========================================================
 router.post('/register', async (req, res) => {
-  try {
-    const { name, email, password, phone, type } = req.body;
+  const connection = await pool.connect();
 
-    if (!name || !email || !password) {
+  try {
+    const {
+      name,
+      email,
+      password,
+      phone,
+      type,
+      bank_account: bankAccount
+    } = req.body;
+
+    if (!name || !email || !password || !phone) {
       return res.status(400).json({
         message: 'กรุณากรอกข้อมูลที่จำเป็นให้ครบถ้วน'
       });
     }
 
-    const { rows: existing } = await pool.query(
+    if (!bankAccount || typeof bankAccount !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'กรุณาเพิ่มบัญชีรับเงินอย่างน้อย 1 บัญชี'
+      });
+    }
+
+    const {
+      payment_type: paymentType = 'BANK_ACCOUNT',
+      bank_code: bankCode,
+      account_name: accountName,
+      account_number: accountNumber,
+      promptpay_type: promptPayType,
+      promptpay_id: promptPayId,
+      receiver_name: receiverName
+    } = bankAccount;
+
+    const cleanAccountName = String(accountName || '').trim();
+    const cleanAccountNumber = String(accountNumber || '').trim();
+    const cleanPromptPayId = String(promptPayId || '').trim();
+    const cleanReceiverName = String(receiverName || '').trim();
+    const allowedBanks = ['KBANK', 'SCB', 'BBL', 'KTB'];
+    const allowedPromptPayTypes = ['PHONE', 'NATIONAL_ID', 'TAX_ID'];
+
+    if (!['BANK_ACCOUNT', 'PROMPTPAY'].includes(paymentType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'วิธีรับเงินไม่ถูกต้อง'
+      });
+    }
+
+    if (paymentType === 'BANK_ACCOUNT') {
+      if (!allowedBanks.includes(bankCode)) {
+        return res.status(400).json({
+          success: false,
+          message: 'ธนาคารไม่ถูกต้อง'
+        });
+      }
+
+      if (!cleanAccountName || !/^[\p{L}\p{M}\s]+$/u.test(cleanAccountName)) {
+        return res.status(400).json({
+          success: false,
+          message: 'ชื่อบัญชีต้องเป็นตัวอักษรเท่านั้น'
+        });
+      }
+
+      if (!cleanAccountNumber || !/^\d+$/.test(cleanAccountNumber)) {
+        return res.status(400).json({
+          success: false,
+          message: 'เลขบัญชีต้องเป็นตัวเลขเท่านั้น'
+        });
+      }
+    } else {
+      if (!allowedPromptPayTypes.includes(promptPayType)) {
+        return res.status(400).json({
+          success: false,
+          message: 'ประเภท PromptPay ไม่ถูกต้อง'
+        });
+      }
+
+      if (!cleanReceiverName || !/^[\p{L}\p{M}\s]+$/u.test(cleanReceiverName)) {
+        return res.status(400).json({
+          success: false,
+          message: 'ชื่อผู้รับเงินต้องเป็นตัวอักษรเท่านั้น'
+        });
+      }
+
+      const promptPayIdValid = promptPayType === 'PHONE'
+        ? /^0\d{9}$/.test(cleanPromptPayId)
+        : /^\d{13}$/.test(cleanPromptPayId);
+
+      if (!promptPayIdValid) {
+        return res.status(400).json({
+          success: false,
+          message: 'หมายเลข PromptPay ไม่ถูกต้อง'
+        });
+      }
+    }
+
+    await connection.query('BEGIN');
+
+    const { rows: existing } = await connection.query(
       'SELECT id FROM merchant WHERE email = $1',
       [email]
     );
 
     if (existing.length > 0) {
+      await connection.query('ROLLBACK');
       return res.status(409).json({
+        success: false,
         message: 'อีเมลนี้ถูกใช้สมัครร้านค้าไปแล้ว'
       });
     }
 
-    await pool.query(
+    const { rows: merchants } = await connection.query(
       `INSERT INTO merchant
         (name, email, password, store_phone, type)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
       [
         name,
         email,
@@ -41,18 +134,59 @@ router.post('/register', async (req, res) => {
       ]
     );
 
+    const merchantId = merchants[0].id;
+
+    await connection.query(
+      `INSERT INTO merchant_bank_accounts
+        (
+          merchant_id,
+          payment_type,
+          bank_code,
+          account_name,
+          account_number,
+          promptpay_type,
+          promptpay_id,
+          receiver_name,
+          is_primary
+        )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)`,
+      [
+        merchantId,
+        paymentType,
+        paymentType === 'BANK_ACCOUNT' ? bankCode : null,
+        paymentType === 'BANK_ACCOUNT' ? cleanAccountName : null,
+        paymentType === 'BANK_ACCOUNT' ? cleanAccountNumber : null,
+        paymentType === 'PROMPTPAY' ? promptPayType : null,
+        paymentType === 'PROMPTPAY' ? cleanPromptPayId : null,
+        paymentType === 'PROMPTPAY' ? cleanReceiverName : null
+      ]
+    );
+
+    await connection.query('COMMIT');
+
     res.status(201).json({
       success: true,
-      message: 'สมัครสมาชิกผู้ค้าสำเร็จ'
+      message: 'สมัครสมาชิกผู้ค้าสำเร็จ',
+      merchant_id: merchantId
     });
   } catch (err) {
+    await connection.query('ROLLBACK');
     console.error(err);
+
+    if (err.code === '23505') {
+      return res.status(409).json({
+        success: false,
+        message: 'อีเมลหรือบัญชีรับเงินนี้ถูกใช้แล้ว'
+      });
+    }
 
     res.status(500).json({
       success: false,
       message: 'เกิดข้อผิดพลาด',
       error: err.message
     });
+  } finally {
+    connection.release();
   }
 });
 
@@ -89,6 +223,7 @@ router.post('/login', async (req, res) => {
     }
 
     delete merchant.password;
+    delete merchant.fcm_token;
 
     res.json({
       success: true,
@@ -100,6 +235,48 @@ router.post('/login', async (req, res) => {
       success: false,
       message: 'เกิดข้อผิดพลาด',
       error: err.message
+    });
+  }
+});
+
+// ==========================================================
+// POST /api/merchants/:id/fcm-token
+// บันทึกอุปกรณ์ที่ใช้รับ Push Notification ของร้านค้า
+// ==========================================================
+router.post('/:id/fcm-token', async (req, res) => {
+  const { fcm_token: fcmToken } = req.body;
+
+  if (!fcmToken) {
+    return res.status(400).json({
+      success: false,
+      message: 'กรุณาระบุ FCM Token'
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE merchant
+       SET fcm_token = $1
+       WHERE id = $2`,
+      [fcmToken, req.params.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบร้านค้านี้'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'บันทึก FCM Token ของร้านค้าเรียบร้อย'
+    });
+  } catch (error) {
+    console.error('Error saving merchant FCM Token:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถบันทึก FCM Token ของร้านค้าได้'
     });
   }
 });
@@ -539,7 +716,7 @@ router.get('/:id/status', async (req, res) => {
   try {
     await expireStores();
     const { rows } = await pool.query(
-      `SELECT status
+      `SELECT status, selling_ends_at
        FROM merchant_status
        WHERE merchant_id = $1`,
       [req.params.id]
@@ -548,7 +725,9 @@ router.get('/:id/status', async (req, res) => {
     res.json({
       success: true,
       status:
-        rows[0]?.status ?? 'ปิดร้าน'
+        rows[0]?.status ?? 'ปิดร้าน',
+      selling_ends_at:
+        rows[0]?.selling_ends_at ?? null
     });
   } catch (error) {
     console.error(
@@ -1130,113 +1309,6 @@ router.get(
       const merchantId =
         req.params.id;
 
-      await pool.query(
-        `INSERT INTO merchant_notifications
-          (
-            merchant_id,
-            source_type,
-            source_id,
-            title,
-            message,
-            event_at
-          )
-
-         SELECT
-           merchant_id,
-           'order',
-           id::text,
-           'มีออเดอร์ใหม่',
-           'ออเดอร์ #' ||
-             id::text ||
-             ' ยอดรวม ' ||
-             total_price::text ||
-             ' บาท',
-           created_at
-
-         FROM orders
-
-         WHERE merchant_id = $1
-
-         ON CONFLICT
-           (
-             merchant_id,
-             source_type,
-             source_id
-           )
-         DO NOTHING`,
-        [merchantId]
-      );
-
-      await pool.query(
-        `INSERT INTO merchant_notifications
-          (
-            merchant_id,
-            source_type,
-            source_id,
-            title,
-            message,
-            event_at
-          )
-
-         SELECT
-           merchant_id,
-           'follower',
-           customer_id::text ||
-             ':' ||
-             merchant_id::text,
-           'มีผู้ติดตามร้านค้ารายใหม่',
-           'ลูกค้ากดติดตามร้านค้าของคุณ',
-           created_at
-
-         FROM followed
-
-         WHERE merchant_id = $1
-
-         ON CONFLICT
-           (
-             merchant_id,
-             source_type,
-             source_id
-           )
-         DO NOTHING`,
-        [merchantId]
-      );
-
-      await pool.query(
-        `INSERT INTO merchant_notifications
-          (
-            merchant_id,
-            source_type,
-            source_id,
-            title,
-            message,
-            event_at
-          )
-
-         SELECT
-           merchant_id,
-           'review',
-           id::text,
-           'มีรีวิวใหม่',
-           'ลูกค้าให้คะแนน ' ||
-             rating::text ||
-             ' ดาว',
-           created_at
-
-         FROM reviews
-
-         WHERE merchant_id = $1
-
-         ON CONFLICT
-           (
-             merchant_id,
-             source_type,
-             source_id
-           )
-         DO NOTHING`,
-        [merchantId]
-      );
-
       const { rows } =
         await pool.query(
           `SELECT
@@ -1457,22 +1529,57 @@ router.get('/:id/orders', async (req, res) => {
     const { rows } =
       await pool.query(
         `SELECT
-           source_order_id AS order_id,
-           customer_id,
-           customer_name,
-           items_summary,
-           total_price,
-           merchant_status,
-           prep_minutes,
-           reject_reason,
-           rejected_at,
-           ordered_at
+           mo.source_order_id AS order_id,
+           mo.customer_id,
+           mo.customer_name,
+           mo.items_summary,
+           mo.total_price,
+           mo.merchant_status,
+           mo.prep_minutes,
+           mo.reject_reason,
+           mo.rejected_at,
+           mo.ordered_at,
+           o.status AS customer_order_status,
+           o.transaction_id,
+           CASE
+             WHEN o.transaction_id IS NOT NULL
+               OR o.status IN (
+                 'PAID',
+                 'ชำระเงินแล้ว',
+                 'พร้อมรับ',
+                 'รับอาหารสำเร็จแล้ว'
+               )
+               OR mo.merchant_status = 'ชำระเงินแล้ว'
+             THEN TRUE
+             ELSE FALSE
+           END AS is_paid,
+           CASE
+             WHEN o.transaction_id IS NOT NULL
+               OR o.status IN (
+                 'PAID',
+                 'ชำระเงินแล้ว',
+                 'พร้อมรับ',
+                 'รับอาหารสำเร็จแล้ว'
+               )
+               OR mo.merchant_status = 'ชำระเงินแล้ว'
+             THEN COALESCE(o.paid_at, mo.updated_at)
+             ELSE NULL
+           END AS paid_at,
+           CASE
+             WHEN o.status = 'รอชำระเงิน'
+             THEN o.payment_deadline
+             ELSE NULL
+           END AS payment_deadline
 
-         FROM merchant_orders
+         FROM merchant_orders mo
 
-         WHERE merchant_id = $1
+         LEFT JOIN orders o
+           ON o.id = mo.source_order_id
+          AND o.merchant_id = mo.merchant_id
 
-         ORDER BY ordered_at DESC`,
+         WHERE mo.merchant_id = $1
+
+         ORDER BY mo.ordered_at DESC`,
         [req.params.id]
       );
 
@@ -1496,7 +1603,7 @@ router.get('/:id/orders', async (req, res) => {
 
 // ==========================================================
 // PUT /api/merchants/:id/orders/:orderId/status
-// อัปเดตสถานะเฉพาะฝั่งร้าน
+// อัปเดตสถานะฝั่งร้านและลูกค้าให้ตรงกัน
 // ==========================================================
 router.put(
   '/:id/orders/:orderId/status',
@@ -1512,6 +1619,12 @@ router.put(
       prep_minutes,
       reject_reason
     } = req.body;
+
+    const customerStatusByMerchantStatus = {
+      'กำลังปรุง': 'รอชำระเงิน',
+      'รอรับสินค้า': 'พร้อมรับ',
+      'ยกเลิก': 'ยกเลิก'
+    };
 
     if (
       !allowedStatuses.includes(
@@ -1538,9 +1651,71 @@ router.put(
       });
     }
 
+    let connection;
+
     try {
+      connection = await pool.connect();
+      await connection.query('BEGIN');
+
+      const { rows: customerOrders } =
+        await connection.query(
+          `SELECT
+             o.status,
+             o.transaction_id,
+             (
+               SELECT mo.merchant_status
+               FROM merchant_orders mo
+               WHERE mo.source_order_id = o.id
+                 AND mo.merchant_id = o.merchant_id
+               LIMIT 1
+             ) AS merchant_status
+           FROM orders o
+           WHERE o.id = $1
+             AND o.merchant_id = $2
+           FOR UPDATE`,
+          [req.params.orderId, req.params.id]
+        );
+
+      if (customerOrders.length === 0) {
+        await connection.query('ROLLBACK');
+        return res.status(404).json({
+          success: false,
+          message:
+            'ไม่พบออเดอร์ฝั่งลูกค้า'
+        });
+      }
+
+      const customerOrder =
+        customerOrders[0];
+      const customerHasPaid =
+        Boolean(
+          customerOrder.transaction_id
+        ) ||
+        [
+          'PAID',
+          'ชำระเงินแล้ว',
+          'พร้อมรับ',
+          'รับอาหารสำเร็จแล้ว'
+        ].includes(
+          customerOrder.status
+        ) ||
+        customerOrder.merchant_status ===
+          'ชำระเงินแล้ว';
+
+      if (
+        status === 'รอรับสินค้า' &&
+        !customerHasPaid
+      ) {
+        await connection.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          message:
+            'ลูกค้ายังไม่ได้ชำระเงิน'
+        });
+      }
+
       const result =
-        await pool.query(
+        await connection.query(
           `UPDATE merchant_orders
 
            SET
@@ -1584,6 +1759,7 @@ router.put(
       if (
         result.rowCount === 0
       ) {
+        await connection.query('ROLLBACK');
         return res.status(404).json({
           success: false,
           message:
@@ -1591,10 +1767,55 @@ router.put(
         });
       }
 
+      const customerStatus =
+        customerStatusByMerchantStatus[
+          status
+        ];
+
+      const customerOrderResult =
+        await connection.query(
+          `UPDATE orders
+           SET
+             status = $1,
+             payment_deadline =
+               CASE
+                 WHEN $1 = 'รอชำระเงิน'
+                 THEN NOW() + INTERVAL '5 minutes'
+                 ELSE payment_deadline
+               END,
+             updated_at = NOW()
+           WHERE id = $2
+             AND merchant_id = $3`,
+          [
+            customerStatus,
+            req.params.orderId,
+            req.params.id
+          ]
+        );
+
+      if (
+        customerOrderResult.rowCount === 0
+      ) {
+        await connection.query('ROLLBACK');
+        return res.status(404).json({
+          success: false,
+          message:
+            'ไม่พบออเดอร์ฝั่งลูกค้า'
+        });
+      }
+
+      await connection.query('COMMIT');
+
       res.json({
-        success: true
+        success: true,
+        merchant_status: status,
+        customer_status: customerStatus
       });
     } catch (error) {
+      if (connection) {
+        await connection.query('ROLLBACK');
+      }
+
       console.error(
         'Error updating merchant order:',
         error
@@ -1605,6 +1826,8 @@ router.put(
         message:
           'ไม่สามารถอัปเดตออเดอร์ได้'
       });
+    } finally {
+      connection?.release();
     }
   }
 );
@@ -1633,24 +1856,32 @@ router.get(
           )
 
          SELECT
-           merchant_id,
-           DATE(ordered_at),
+           mo.merchant_id,
+           DATE(COALESCE(o.paid_at, mo.updated_at, mo.ordered_at)),
            COUNT(*),
-           SUM(total_price)
+           SUM(ROUND(mo.total_price * 0.98, 2))
 
-         FROM merchant_orders
+         FROM merchant_orders mo
 
-         WHERE merchant_id = $1
+         LEFT JOIN orders o
+           ON o.id = mo.source_order_id
+          AND o.merchant_id = mo.merchant_id
 
-           AND merchant_status IN (
+         WHERE mo.merchant_id = $1
+
+           AND o.transaction_id IS NOT NULL
+           AND o.paid_at IS NOT NULL
+
+           AND mo.merchant_status IN (
              'กำลังปรุง',
+             'ชำระเงินแล้ว',
              'รอรับสินค้า',
              'เสร็จสิ้น'
            )
 
          GROUP BY
-           merchant_id,
-           DATE(ordered_at)`,
+           mo.merchant_id,
+           DATE(COALESCE(o.paid_at, mo.updated_at, mo.ordered_at))`,
         [req.params.id]
       );
 
@@ -1689,9 +1920,70 @@ router.get(
         [req.params.id]
       );
 
+      const {
+        rows: periodTotals
+      } = await pool.query(
+        `SELECT
+           COALESCE(
+             SUM(total_orders) FILTER (
+               WHERE sale_date = CURRENT_DATE
+             ),
+             0
+           )::int AS today_orders,
+           COALESCE(
+             SUM(total_sales) FILTER (
+               WHERE sale_date = CURRENT_DATE
+             ),
+             0
+           ) AS today_sales,
+           COALESCE(
+             SUM(total_orders) FILTER (
+               WHERE sale_date >= DATE_TRUNC('week', CURRENT_DATE)::date
+             ),
+             0
+           )::int AS week_orders,
+           COALESCE(
+             SUM(total_sales) FILTER (
+               WHERE sale_date >= DATE_TRUNC('week', CURRENT_DATE)::date
+             ),
+             0
+           ) AS week_sales,
+           COALESCE(
+             SUM(total_orders) FILTER (
+               WHERE sale_date >= DATE_TRUNC('year', CURRENT_DATE)::date
+             ),
+             0
+           )::int AS year_orders,
+           COALESCE(
+             SUM(total_sales) FILTER (
+               WHERE sale_date >= DATE_TRUNC('year', CURRENT_DATE)::date
+             ),
+             0
+           ) AS year_sales
+
+         FROM merchant_sales_summary
+
+         WHERE merchant_id = $1`,
+        [req.params.id]
+      );
+
+      const period = periodTotals[0] || {};
+
       res.json({
         success: true,
         daily,
+        today: {
+          orders: Number(period.today_orders || 0),
+          sales: period.today_sales || 0
+        },
+        week: {
+          orders: Number(period.week_orders || 0),
+          sales: period.week_sales || 0
+        },
+        year: {
+          orders: Number(period.year_orders || 0),
+          sales: period.year_sales || 0
+        },
         available_balance:
           totals[0]
             .available_balance

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
+const { sendMerchantNotification } = require('../services/merchant_push_notification');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -12,7 +13,14 @@ let firebaseReady = false;
 
 try {
   if (getApps().length === 0) {
-    const serviceAccount = require('../serviceAccountKey.json');
+    let serviceAccount;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      serviceAccount = typeof process.env.FIREBASE_SERVICE_ACCOUNT === 'string'
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+        : process.env.FIREBASE_SERVICE_ACCOUNT;
+    } else {
+      serviceAccount = require('../serviceAccountKey.json');
+    }
 
     initializeApp({
       credential: cert(serviceAccount),
@@ -128,6 +136,23 @@ router.post('/create', async (req, res) => {
       );
     }
 
+    // ส่งออเดอร์เข้าตาราง merchant_orders ของร้านค้า
+await pool.query(
+  'INSERT INTO merchant_orders (source_order_id, merchant_id, customer_id, merchant_status) VALUES ($1, $2, $3, $4)',
+  [newOrderId, mId, customer_id, 'ใหม่']
+);
+
+    sendMerchantNotification({
+      merchantId: mId,
+      sourceType: 'order',
+      sourceId: newOrderId,
+      title: 'มีออเดอร์ใหม่',
+      message: `ออเดอร์ #${newOrderId} ยอดรวม ${total_price} บาท`,
+      data: {
+        order_id: newOrderId
+      }
+    });
+
     await sendPushNotification(
       customer_id,
       'สั่งอาหารสำเร็จแล้ว',
@@ -170,6 +195,9 @@ router.get(
           o.status,
           o.refund_status,
           o.created_at,
+          mo.prep_minutes,
+          mo.reject_reason,
+          mo.rejected_at,
           oi.item_name,
           oi.quantity,
           oi.price,
@@ -182,6 +210,9 @@ router.get(
           ON o.merchant_id = m.id
         LEFT JOIN order_items oi
           ON o.id = oi.order_id
+        LEFT JOIN merchant_orders mo
+          ON o.id = mo.source_order_id
+          AND o.merchant_id = mo.merchant_id
         LEFT JOIN reviews r
           ON o.id = r.order_id
         WHERE o.customer_id = $1
@@ -209,6 +240,12 @@ router.get(
               row.refund_status,
             created_at:
               row.created_at,
+            prep_minutes:
+              row.prep_minutes,
+            reject_reason:
+              row.reject_reason,
+            rejected_at:
+              row.rejected_at,
             ratingScore:
               row.ratingScore,
             comment: row.comment,
@@ -257,9 +294,16 @@ router.get(
 router.get('/:id', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT *
-       FROM orders
-       WHERE id = $1`,
+      `SELECT
+         o.*,
+         mo.prep_minutes,
+         mo.reject_reason,
+         mo.rejected_at
+       FROM orders o
+       LEFT JOIN merchant_orders mo
+         ON o.id = mo.source_order_id
+         AND o.merchant_id = mo.merchant_id
+       WHERE o.id = $1`,
       [req.params.id]
     );
 
@@ -289,6 +333,113 @@ router.get('/:id', async (req, res) => {
 });
 
 // ==========================================================
+// PUT /api/orders/:id/cancel
+// ยกเลิกคำสั่งซื้อโดยลูกค้าและซิงก์สถานะไปฝั่งร้านค้า
+// ==========================================================
+router.put('/:id/cancel', async (req, res) => {
+  const orderId = req.params.id;
+  const reason = String(req.body?.reason || 'ลูกค้าขอยกเลิกคำสั่งซื้อ').trim();
+  let connection;
+
+  try {
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+
+    const { rows: orders } = await connection.query(
+      `SELECT id, merchant_id, status
+       FROM orders
+       WHERE id = $1
+       FOR UPDATE`,
+      [orderId]
+    );
+
+    if (orders.length === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์นี้'
+      });
+    }
+
+    const order = orders[0];
+    const nonCancellableStatuses = [
+      'PAID',
+      'ชำระเงินแล้ว',
+      'กำลังปรุง',
+      'พร้อมรับ',
+      'รอรับสินค้า',
+      'รับอาหารสำเร็จแล้ว',
+      'สำเร็จ'
+    ];
+
+    if (nonCancellableStatuses.includes(order.status)) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'ไม่สามารถยกเลิกออเดอร์ที่กำลังดำเนินการหรือชำระเงินแล้วได้'
+      });
+    }
+
+    const merchantResult = await connection.query(
+      `UPDATE merchant_orders
+       SET merchant_status = 'ยกเลิก',
+           reject_reason = $1,
+           rejected_at = NOW()
+       WHERE source_order_id = $2
+         AND merchant_id = $3`,
+      [reason || 'ลูกค้าขอยกเลิกคำสั่งซื้อ', orderId, order.merchant_id]
+    );
+
+    if (merchantResult.rowCount === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์ฝั่งร้านค้า'
+      });
+    }
+
+    await connection.query(
+      `UPDATE orders
+       SET status = 'ยกเลิก'
+       WHERE id = $1`,
+      [orderId]
+    );
+
+    await connection.query('COMMIT');
+
+    await sendMerchantNotification({
+      merchantId: order.merchant_id,
+      sourceType: 'order_cancelled',
+      sourceId: orderId,
+      title: 'ออเดอร์ถูกยกเลิก',
+      message: `ออเดอร์ #${orderId} ถูกยกเลิกโดยลูกค้า`,
+      data: {
+        order_id: orderId,
+        cancelled_by: 'customer'
+      }
+    });
+
+    res.json({
+      success: true,
+      status: 'ยกเลิก',
+      message: 'ยกเลิกออเดอร์และซิงก์สถานะไปฝั่งร้านค้าสำเร็จ'
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.query('ROLLBACK');
+    }
+
+    console.error('Error cancelling order:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถยกเลิกออเดอร์ได้'
+    });
+  } finally {
+    connection?.release();
+  }
+});
+
+// ==========================================================
 // 4. PUT /api/orders/:id/complete
 // ==========================================================
 router.put(
@@ -300,7 +451,7 @@ router.put(
       const {
         rows: orderRows,
       } = await pool.query(
-        `SELECT customer_id
+        `SELECT customer_id, merchant_id
          FROM orders
          WHERE id = $1`,
         [orderId]
@@ -327,6 +478,18 @@ router.put(
           'รับอาหารสำเร็จแล้ว',
           `ออเดอร์ #${orderId} ขอบคุณที่ใช้บริการ ขอให้อร่อยกับมื้ออาหาร`
         );
+
+        await sendMerchantNotification({
+          merchantId: orderRows[0].merchant_id,
+          sourceType: 'order_completed',
+          sourceId: orderId,
+          title: 'คำสั่งซื้อเสร็จสิ้น',
+          message: `ออเดอร์ #${orderId} ลูกค้ายืนยันรับอาหารแล้ว`,
+          data: {
+            order_id: orderId,
+            completed_by: 'customer'
+          }
+        });
       }
 
       res.json({
@@ -363,7 +526,7 @@ router.post('/review', async (req, res) => {
   } = req.body;
 
   try {
-    await pool.query(
+    const { rows: reviews } = await pool.query(
       `INSERT INTO reviews
        (
          order_id,
@@ -373,7 +536,8 @@ router.post('/review', async (req, res) => {
          comment,
          images
        )
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
       [
         order_id,
         merchant_id,
@@ -383,6 +547,17 @@ router.post('/review', async (req, res) => {
         JSON.stringify(images),
       ]
     );
+
+    sendMerchantNotification({
+      merchantId: merchant_id,
+      sourceType: 'review',
+      sourceId: reviews[0].id,
+      title: 'มีรีวิวใหม่',
+      message: `ลูกค้าให้คะแนน ${rating} ดาว`,
+      data: {
+        order_id
+      }
+    });
 
     await pool.query(
       `UPDATE orders

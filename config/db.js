@@ -13,7 +13,7 @@ const testConnection = async () => {
     console.log('✅ เชื่อมต่อ Supabase PostgreSQL สำเร็จ');
     client.release();
   } catch (error) {
-    console.error('❌ ไม่สามารถเชื่อมต่อฐานข้อมูลได้:', error.message);
+    console.error('❌ ไม่สามารถเชื่อมต่อฐานข้อมูลได้:', error.message || error);
   }
 };
 

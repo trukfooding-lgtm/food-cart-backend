@@ -32,6 +32,8 @@ app.get('/', (req, res) => {
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
 app.use('/api/orders', ordersRoutes);
+const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
+app.use('/api', paymentRoutes);
 
 app.post('/api/otp/send', async (req, res) => {
   const { email } = req.body;

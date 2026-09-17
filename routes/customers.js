@@ -4,6 +4,7 @@ const { pool } = require('../config/db');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { sendMerchantNotification } = require('../services/merchant_push_notification');
 
 // ==========================================================
 // ตั้งค่าโฟลเดอร์ uploads สำหรับเก็บรูปโปรไฟล์
@@ -524,6 +525,17 @@ router.post('/follow', async (req, res) => {
         merchant_id,
       ]
     );
+
+    sendMerchantNotification({
+      merchantId: merchant_id,
+      sourceType: 'follower',
+      sourceId: `${customer_id}:${merchant_id}`,
+      title: 'มีผู้ติดตามร้านค้ารายใหม่',
+      message: 'ลูกค้ากดติดตามร้านค้าของคุณ',
+      data: {
+        customer_id
+      }
+    });
 
     res.json({
       success: true,
