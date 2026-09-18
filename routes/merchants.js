@@ -1638,6 +1638,7 @@ router.put(
   '/:id/orders/:orderId/status',
   async (req, res) => {
     const allowedStatuses = [
+      'รอชำระเงิน',
       'กำลังปรุง',
       'รอรับสินค้า',
       'ยกเลิก'
@@ -1650,6 +1651,7 @@ router.put(
     } = req.body;
 
     const customerStatusByMerchantStatus = {
+      'รอชำระเงิน': 'รอชำระเงิน',
       'กำลังปรุง': 'รอชำระเงิน',
       'รอรับสินค้า': 'พร้อมรับ',
       'ยกเลิก': 'ยกเลิก'
