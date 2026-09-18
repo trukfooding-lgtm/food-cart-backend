@@ -1595,7 +1595,26 @@ router.get('/:id/orders', async (req, res) => {
              WHEN o.status = 'รอชำระเงิน'
              THEN o.payment_deadline
              ELSE NULL
-           END AS payment_deadline
+           END AS payment_deadline,
+           COALESCE(
+             to_jsonb(o)->>'customer_points',
+             to_jsonb(o)->>'points_balance',
+             to_jsonb(o)->>'points_remaining',
+             to_jsonb(o)->>'loyalty_points',
+             to_jsonb(o)->>'reward_points'
+           ) AS customer_points,
+           COALESCE(
+             to_jsonb(o)->>'points_used',
+             to_jsonb(o)->>'used_points',
+             to_jsonb(o)->>'points_redeemed',
+             to_jsonb(o)->>'redeemed_points'
+           ) AS points_used,
+           COALESCE(
+             to_jsonb(o)->>'points_discount',
+             to_jsonb(o)->>'points_discount_amount',
+             to_jsonb(o)->>'redeemed_amount',
+             to_jsonb(o)->>'discount_from_points'
+           ) AS points_discount
 
          FROM orders o
 
