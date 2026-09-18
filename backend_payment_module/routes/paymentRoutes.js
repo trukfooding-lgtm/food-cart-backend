@@ -382,24 +382,16 @@ async function handlePostPaymentSlip(req, res) {
     }
 
     const merchant = await getMerchantPaymentConfig(order.merchant_id);
-    let verification = evaluateClientOcr({
-      expectedAmount,
-      detectedAmount: req.body.detectedAmount,
-      ocrStatus: req.body.ocrStatus,
-      ocrText: req.body.ocrText
-    });
-
-    if (!verification.verified && req.file && req.file.buffer) {
-      console.log('🔍 [Server OCR] Executing server-side OCR on slip image...');
-      const serverResult = await performServerOcr(req.file.buffer, expectedAmount);
-      if (serverResult) {
-        if (serverResult.verified) {
-          verification = serverResult;
-        } else if (!verification.reason || verification.reason.includes('ไม่ได้')) {
-          verification = serverResult;
-        }
-      }
-    }
+    // ตรวจจากไฟล์ภาพบน Backend เท่านั้น ห้ามเชื่อค่า OCR/ยอดเงินที่ client ส่งมา
+    // เพื่อป้องกันการปลอมค่าให้สลิปที่ไม่ผ่านกลายเป็นสลิปผ่าน
+    console.log('🔍 [Server OCR] Executing server-side OCR on slip image...');
+    const verification = await performServerOcr(req.file.buffer, expectedAmount) || {
+      verified: false,
+      detectedAmount: null,
+      ocrStatus: 'UNREADABLE',
+      ocrText: '',
+      reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาแนบสลิปจริงที่ชัดเจน'
+    };
 
     const transactionId = `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
 
@@ -476,7 +468,7 @@ async function handlePostPaymentSlip(req, res) {
     );
     await connection.query(
       `UPDATE merchant_orders
-       SET merchant_status = 'กำลังปรุง', updated_at = NOW()
+       SET merchant_status = 'ชำระเงินแล้ว', updated_at = NOW()
        WHERE source_order_id = $1 AND merchant_id = $2`,
       [cleanOrderId, order.merchant_id]
     );
@@ -487,7 +479,7 @@ async function handlePostPaymentSlip(req, res) {
       sourceType: 'payment_verified',
       sourceId: cleanOrderId,
       title: 'ลูกค้าชำระเงินแล้ว',
-      message: `ออเดอร์ #${cleanOrderId} ยอด ฿${expectedAmount.toFixed(2)} ตรวจสอบสลิปอัตโนมัติแล้ว`,
+      message: `ออเดอร์ #${cleanOrderId} ยอด ฿${expectedAmount.toFixed(2)} ตรวจสอบสลิปผ่านแล้ว กรุณาตรวจสอบและกดยืนยันรับสลิป`,
       data: { order_id: cleanOrderId, payment_status: 'VERIFIED' }
     });
 

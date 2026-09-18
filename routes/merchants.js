@@ -1652,7 +1652,7 @@ router.put(
 
     const customerStatusByMerchantStatus = {
       'รอชำระเงิน': 'รอชำระเงิน',
-      'กำลังปรุง': 'รอชำระเงิน',
+      'กำลังปรุง': 'ชำระเงินแล้ว',
       'รอรับสินค้า': 'พร้อมรับ',
       'ยกเลิก': 'ยกเลิก'
     };
@@ -1734,7 +1734,7 @@ router.put(
           'ชำระเงินแล้ว';
 
       if (
-        status === 'รอรับสินค้า' &&
+        (status === 'กำลังปรุง' || status === 'รอรับสินค้า') &&
         !customerHasPaid
       ) {
         await connection.query('ROLLBACK');
@@ -1743,6 +1743,26 @@ router.put(
           message:
             'ลูกค้ายังไม่ได้ชำระเงิน'
         });
+      }
+
+      if (status === 'กำลังปรุง') {
+        const { rows: verifiedSlips } = await connection.query(
+          `SELECT 1
+           FROM order_slips
+           WHERE order_id = $1
+             AND status = 'VERIFIED'
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [req.params.orderId]
+        );
+
+        if (verifiedSlips.length === 0) {
+          await connection.query('ROLLBACK');
+          return res.status(409).json({
+            success: false,
+            message: 'ยังไม่พบสลิปที่ผ่านการตรวจสอบ'
+          });
+        }
       }
 
       const result =
