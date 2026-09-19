@@ -1342,6 +1342,38 @@ router.get(
 );
 
 // ==========================================================
+// DELETE /api/merchants/:id/notifications
+// ลบการแจ้งเตือนทั้งหมดของร้านค้า
+// ==========================================================
+router.delete(
+  '/:id/notifications',
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `DELETE FROM merchant_notifications
+         WHERE merchant_id = $1`,
+        [req.params.id]
+      );
+
+      res.json({
+        success: true,
+        deletedCount: result.rowCount || 0
+      });
+    } catch (error) {
+      console.error(
+        'Error deleting merchant notifications:',
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+        message: 'ไม่สามารถลบการแจ้งเตือนได้'
+      });
+    }
+  }
+);
+
+// ==========================================================
 // POST /api/merchants/:id/issue-reports
 // ส่งรายงานปัญหา
 // ==========================================================
