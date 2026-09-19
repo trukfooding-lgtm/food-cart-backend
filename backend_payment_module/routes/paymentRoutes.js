@@ -524,11 +524,17 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     const { rows } = await pool.query(
       `SELECT os.order_id, os.slip_url, os.expected_amount, os.detected_amount,
               os.status, os.validation_reason, os.created_at,
-              o.customer_id, c.name_surname AS customer_name
+              COALESCE(o.customer_id, mo.customer_id) AS customer_id,
+              c.name_surname AS customer_name
        FROM order_slips os
-       JOIN orders o ON o.id::text = os.order_id
-       LEFT JOIN customer c ON c.customer_id = o.customer_id
-       WHERE os.order_id = $1 AND o.merchant_id = $2
+       LEFT JOIN orders o ON o.id::text = os.order_id
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id::text = os.order_id
+        AND mo.merchant_id = $2
+       LEFT JOIN customer c
+         ON c.customer_id = COALESCE(o.customer_id, mo.customer_id)
+       WHERE os.order_id = $1
+         AND COALESCE(o.merchant_id, mo.merchant_id) = $2
        ORDER BY os.created_at DESC
        LIMIT 1`,
       [String(req.params.orderId).replace(/[^0-9]/g, ''), req.params.merchantId]
@@ -547,10 +553,16 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async 
   try {
     const orderId = String(req.params.orderId).replace(/[^0-9]/g, '');
     const { rows } = await pool.query(
-      `SELECT o.customer_id, os.validation_reason
-       FROM orders o
-       JOIN order_slips os ON os.order_id = o.id::text
-       WHERE o.id = $1 AND o.merchant_id = $2 AND os.status = 'REJECTED'
+      `SELECT COALESCE(o.customer_id, mo.customer_id) AS customer_id,
+              os.validation_reason
+       FROM order_slips os
+       LEFT JOIN orders o ON o.id::text = os.order_id
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id::text = os.order_id
+        AND mo.merchant_id = $2
+       WHERE os.order_id = $1
+         AND COALESCE(o.merchant_id, mo.merchant_id) = $2
+         AND os.status = 'REJECTED'
        ORDER BY os.created_at DESC
        LIMIT 1`,
       [orderId, req.params.merchantId]
