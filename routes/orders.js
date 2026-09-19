@@ -849,6 +849,63 @@ router.put(
 // ==========================================================
 const usedSlipTransactions = new Set();
 
+function parsedFloatOrNull(value) {
+ const parsed = parseFloat(value || '');
+ return Number.isFinite(parsed) ? parsed : null;
+}
+
+// เก็บสลิปที่ตรวจไม่ผ่านไว้ให้ร้านค้าเปิดตรวจสอบและรายงานได้
+// โดยไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้ว
+async function recordRejectedSlip({
+ orderId,
+ customerId,
+ merchantId,
+ slipUrl,
+ expectedAmount,
+ detectedAmount,
+ reason,
+ ocrText,
+ }) {
+ try {
+   await pool.query(
+     `INSERT INTO order_slips
+       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
+        detected_amount, status, note, validation_reason, ocr_text,
+        transaction_id, payment_channel, verified_at)
+      VALUES
+       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, 'REJECTED', $7, $7, $8,
+        $9, NULL, NULL)`,
+     [
+       String(orderId),
+       customerId,
+       slipUrl,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       Number.isFinite(expectedAmount) ? expectedAmount : null,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
+       String(ocrText || '').slice(0, 8000),
+       `REJECTED_${orderId}_${Date.now()}`,
+     ],
+   );
+ } catch (error) {
+   // การบันทึกหลักฐานต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
+   console.warn('Rejected slip record warning:', error.message);
+ }
+
+ try {
+   await sendMerchantNotification({
+     merchantId,
+     sourceType: 'payment_slip_rejected',
+     sourceId: orderId,
+     title: 'ตรวจพบสลิปผิดปกติ',
+     message: `ออเดอร์ #${orderId}: ${String(reason || 'ระบบตรวจพบสลิปผิดปกติ')}`,
+     data: { order_id: orderId, payment_status: 'REJECTED' },
+   });
+ } catch (error) {
+   console.warn('Rejected slip notification warning:', error.message);
+ }
+}
+
 router.post(
   '/:id/payment-slip',
   upload.single('slip'),
@@ -901,10 +958,21 @@ router.post(
 
       if (normTxId) {
         if (usedSlipTransactions.has(normTxId)) {
+          const reason = `ตรวจพบการใช้สลิปซ้ำ รหัสธุรกรรม (${transactionId}) นี้เคยถูกใช้งานไปแล้ว`;
+          await recordRejectedSlip({
+            orderId,
+            customerId,
+            merchantId: mId,
+            slipUrl,
+            expectedAmount: dbOrderTotal,
+            detectedAmount: parsedFloatOrNull(detectedAmount || expectedAmount),
+            reason,
+            ocrText,
+          });
           return res.status(400).json({
             success: false,
             status: 'REJECTED',
-            message: `ตรวจพบการใช้สลิปซ้ำ รหัสธุรกรรม (${transactionId}) นี้เคยถูกใช้งานไปแล้ว`,
+            message: reason,
           });
         }
       }
@@ -914,19 +982,41 @@ router.post(
         detectedAmount || expectedAmount || 0
       );
       if (Math.abs(parsedDetectedAmount - dbOrderTotal) > 0.01) {
+        const reason = `ยอดเงินในสลิป (฿${parsedDetectedAmount.toFixed(2)}) ไม่ตรงกับยอดคำสั่งซื้อจริง (฿${dbOrderTotal.toFixed(2)})`;
+        await recordRejectedSlip({
+          orderId,
+          customerId,
+          merchantId: mId,
+          slipUrl,
+          expectedAmount: dbOrderTotal,
+          detectedAmount: parsedDetectedAmount,
+          reason,
+          ocrText,
+        });
         return res.status(400).json({
           success: false,
           status: 'REJECTED',
-          message: `ยอดเงินในสลิป (฿${parsedDetectedAmount.toFixed(2)}) ไม่ตรงกับยอดคำสั่งซื้อจริง (฿${dbOrderTotal.toFixed(2)})`,
+          message: reason,
         });
       }
 
       // Layer 4: ตรวจสอบสถานะการคัดกรองเบื้องต้น
       if (ocrStatus === 'REJECTED') {
+        const reason = 'สลิปไม่ผ่านการตรวจสอบความถูกต้องของระบบธนาคาร';
+        await recordRejectedSlip({
+          orderId,
+          customerId,
+          merchantId: mId,
+          slipUrl,
+          expectedAmount: dbOrderTotal,
+          detectedAmount: parsedDetectedAmount,
+          reason,
+          ocrText,
+        });
         return res.status(400).json({
           success: false,
           status: 'REJECTED',
-          message: 'สลิปไม่ผ่านการตรวจสอบความถูกต้องของระบบธนาคาร',
+          message: reason,
         });
       }
 
@@ -947,6 +1037,21 @@ router.post(
 
       // Layer 5: จัดการเคสที่ไม่แน่ใจ หรือต้องตรวจสอบเพิ่มเติม (MANUAL_REVIEW)
       if (ocrStatus === 'MANUAL_REVIEW' || !normTxId) {
+        const isUnreadableSlip = ocrStatus === 'UNREADABLE';
+        if (isUnreadableSlip) {
+          const reason =
+            'รูปภาพไม่มีหลักฐานหรือสำเนาของธนาคารที่ถูกต้อง (ตรวจพบสลิปไม่แท้หรืออ่านสลิปไม่ได้)';
+          await recordRejectedSlip({
+            orderId,
+            customerId,
+            merchantId: mId,
+            slipUrl,
+            expectedAmount: dbOrderTotal,
+            detectedAmount: parsedDetectedAmount,
+            reason,
+            ocrText,
+          });
+        }
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
 
         await sendPushNotification(
@@ -955,7 +1060,7 @@ router.post(
           `ออเดอร์ #${orderId} ร้านค้ากำลังตรวจสอบหลักฐานการชำระเงินของคุณ`
         );
 
-        if (typeof sendMerchantNotification === 'function') {
+        if (!isUnreadableSlip && typeof sendMerchantNotification === 'function') {
           try {
             await sendMerchantNotification({
               merchantId: mId,
