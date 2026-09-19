@@ -48,7 +48,7 @@ router.post('/register', async (req, res) => {
     const cleanPromptPayId = String(promptPayId || '').trim();
     const cleanReceiverName = String(receiverName || '').trim();
     const allowedBanks = ['KBANK', 'SCB', 'BBL', 'KTB'];
-    const allowedPromptPayTypes = ['PHONE', 'NATIONAL_ID', 'TAX_ID'];
+    const allowedPromptPayTypes = ['PHONE'];
 
     if (!['BANK_ACCOUNT', 'PROMPTPAY'].includes(paymentType)) {
       return res.status(400).json({
@@ -93,9 +93,7 @@ router.post('/register', async (req, res) => {
         });
       }
 
-      const promptPayIdValid = promptPayType === 'PHONE'
-        ? /^0\d{9}$/.test(cleanPromptPayId)
-        : /^\d{13}$/.test(cleanPromptPayId);
+      const promptPayIdValid = /^0\d{9}$/.test(cleanPromptPayId);
 
       if (!promptPayIdValid) {
         return res.status(400).json({
@@ -2387,11 +2385,7 @@ router.post(
       'KTB'
     ];
 
-    const allowedPromptPayTypes = [
-      'PHONE',
-      'NATIONAL_ID',
-      'TAX_ID'
-    ];
+    const allowedPromptPayTypes = ['PHONE'];
 
     if (
       ![
@@ -2485,30 +2479,11 @@ router.post(
         });
       }
 
-      if (
-        promptpay_type ===
-          'PHONE' &&
-        !/^0\d{9}$/.test(
-          cleanPromptPayId
-        )
-      ) {
+      if (!/^0\d{9}$/.test(cleanPromptPayId)) {
         return res.status(400).json({
           success: false,
           message:
             'หมายเลขโทรศัพท์ไม่ถูกต้อง'
-        });
-      }
-
-      if (
-        promptpay_type !==
-          'PHONE' &&
-        cleanPromptPayId.length !==
-          13
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            'หมายเลข PromptPay ต้องมี 13 หลัก'
         });
       }
     }
