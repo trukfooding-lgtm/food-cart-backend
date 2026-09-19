@@ -164,14 +164,18 @@ async function getMerchantPaymentConfig(merchantId) {
 
   if (pool) {
     try {
-      // ค้นหาเฉพาะบัญชีหลักที่ร้านตั้งไว้ จึงไม่ส่งหลายช่องทางให้ลูกค้าเลือก
+      // เลือกบัญชีหลัก และอนุญาตเฉพาะ PromptPay ที่เป็นเบอร์โทรศัพท์
       let bankResult = null;
       try {
         bankResult = await pool.query(
           `SELECT *
            FROM merchant_bank_accounts
-           WHERE merchant_id = $1 AND is_primary = 1
-           ORDER BY id ASC
+           WHERE merchant_id = $1
+             AND (
+               UPPER(COALESCE(payment_type, 'BANK_ACCOUNT')) <> 'PROMPTPAY'
+               OR UPPER(COALESCE(promptpay_type, '')) = 'PHONE'
+             )
+           ORDER BY is_primary DESC, id ASC
            LIMIT 1`,
           [cleanId]
         );
@@ -179,7 +183,15 @@ async function getMerchantPaymentConfig(merchantId) {
         // กรณีชื่อตารางเป็น bank_accounts
         try {
           bankResult = await pool.query(
-            'SELECT * FROM bank_accounts WHERE merchant_id = $1 AND is_primary = 1 ORDER BY id ASC LIMIT 1',
+            `SELECT *
+             FROM bank_accounts
+             WHERE merchant_id = $1
+               AND (
+                 UPPER(COALESCE(payment_type, 'BANK_ACCOUNT')) <> 'PROMPTPAY'
+                 OR UPPER(COALESCE(promptpay_type, '')) = 'PHONE'
+               )
+             ORDER BY is_primary DESC, id ASC
+             LIMIT 1`,
             [cleanId]
           );
         } catch (_) {}
