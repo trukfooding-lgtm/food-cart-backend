@@ -1037,10 +1037,13 @@ router.post(
 
       // Layer 5: จัดการเคสที่ไม่แน่ใจ หรือต้องตรวจสอบเพิ่มเติม (MANUAL_REVIEW)
       if (ocrStatus === 'MANUAL_REVIEW' || !normTxId) {
-        const isUnreadableSlip = ocrStatus === 'UNREADABLE';
-        if (isUnreadableSlip) {
+        const isMerchantRejectedSlip =
+          ocrStatus === 'UNREADABLE' || ocrStatus === 'MANUAL_REVIEW';
+        if (isMerchantRejectedSlip) {
           const reason =
-            'รูปภาพไม่มีหลักฐานหรือสำเนาของธนาคารที่ถูกต้อง (ตรวจพบสลิปไม่แท้หรืออ่านสลิปไม่ได้)';
+            ocrStatus === 'MANUAL_REVIEW'
+              ? 'สลิปยังไม่ผ่านการตรวจสอบ กรุณาตรวจสอบหลักฐานการชำระเงิน'
+              : 'รูปภาพไม่มีหลักฐานหรือสำเนาของธนาคารที่ถูกต้อง (ตรวจพบสลิปไม่แท้หรืออ่านสลิปไม่ได้)';
           await recordRejectedSlip({
             orderId,
             customerId,
@@ -1060,7 +1063,7 @@ router.post(
           `ออเดอร์ #${orderId} ร้านค้ากำลังตรวจสอบหลักฐานการชำระเงินของคุณ`
         );
 
-        if (!isUnreadableSlip && typeof sendMerchantNotification === 'function') {
+        if (!isMerchantRejectedSlip && typeof sendMerchantNotification === 'function') {
           try {
             await sendMerchantNotification({
               merchantId: mId,
