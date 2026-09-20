@@ -641,4 +641,80 @@ router.post(
   }
 );
 
+// ==========================================================
+// 11. POST /api/customers/:customerId/issue-reports
+// ลูกค้ารายงานปัญหา (บันทึกลง app_issue_reports)
+// ==========================================================
+router.post('/:customerId/issue-reports', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { issue_type, order_reference, details, image_url } = req.body;
+
+    if (!issue_type || !details) {
+      return res.status(400).json({
+        success: false,
+        message: 'กรุณากรอกข้อมูลรายงานปัญหาให้ครบถ้วน',
+      });
+    }
+
+    let reportId = null;
+
+    // 1. บันทึกลงตาราง app_issue_reports (ตารางรวมที่แยก sender_type: CUSTOMER / MERCHANT)
+    try {
+      const isPg = pool.totalCount !== undefined || pool.options !== undefined || pool.connect !== undefined;
+      if (isPg) {
+        const result = await pool.query(
+          `INSERT INTO app_issue_reports (sender_type, customer_id, issue_type, order_reference, details, image_url, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING id`,
+          ['CUSTOMER', customerId, issue_type, order_reference || null, details, image_url || null]
+        );
+        reportId = result?.rows?.[0]?.id;
+      } else {
+        const [result] = await pool.query(
+          `INSERT INTO app_issue_reports (sender_type, customer_id, issue_type, order_reference, details, image_url, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+          ['CUSTOMER', customerId, issue_type, order_reference || null, details, image_url || null]
+        );
+        reportId = result?.insertId;
+      }
+    } catch (tableErr) {
+      console.warn('⚠️ ไม่สามารถบันทึกลง app_issue_reports ได้ (จะลองตาราง issue_reports สำรอง):', tableErr.message);
+      // 2. สำรอง: หากยังไม่ได้สร้างตาราง app_issue_reports ให้บันทึกลง issue_reports เดิม
+      try {
+        const customerMeta = `[ลูกค้า ID: ${customerId}] ${details}`;
+        const isPg = pool.totalCount !== undefined || pool.options !== undefined || pool.connect !== undefined;
+        if (isPg) {
+          const result = await pool.query(
+            `INSERT INTO issue_reports (merchant_id, issue_type, order_reference, details, image_url, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id`,
+            [1, issue_type, order_reference || null, customerMeta, image_url || null]
+          );
+          reportId = result?.rows?.[0]?.id;
+        } else {
+          const [result] = await pool.query(
+            `INSERT INTO issue_reports (merchant_id, issue_type, order_reference, details, image_url, created_at)
+             VALUES (?, ?, ?, ?, ?, NOW())`,
+            [1, issue_type, order_reference || null, customerMeta, image_url || null]
+          );
+          reportId = result?.insertId;
+        }
+      } catch (backupErr) {
+        console.error('⚠️ สำรอง issue_reports ล้มเหลว:', backupErr.message);
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: 'ส่งรายงานปัญหาเรียบร้อยแล้ว',
+      id: reportId,
+    });
+  } catch (error) {
+    console.error('Error submitting customer issue report:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'เกิดข้อผิดพลาดในการบันทึกรายงานปัญหา',
+    });
+  }
+});
+
 module.exports = router;
