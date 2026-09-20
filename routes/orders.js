@@ -866,15 +866,18 @@ async function recordRejectedSlip({
  reason,
  ocrText,
  }) {
+ let slipNotificationId = `attempt-${Date.now()}`;
+
  try {
-   await pool.query(
+   const { rows: insertedSlipRows } = await pool.query(
      `INSERT INTO order_slips
        (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
         detected_amount, status, note, validation_reason, ocr_text,
         transaction_id, payment_channel, verified_at)
       VALUES
        ($1, 'CUSTOMER', $2, $3, $4, $5, $6, 'REJECTED', $7, $7, $8,
-        $9, NULL, NULL)`,
+        $9, NULL, NULL)
+       RETURNING id`,
      [
        String(orderId),
        customerId,
@@ -887,6 +890,10 @@ async function recordRejectedSlip({
        `REJECTED_${orderId}_${Date.now()}`,
      ],
    );
+
+   if (insertedSlipRows[0]?.id != null) {
+     slipNotificationId = String(insertedSlipRows[0].id);
+   }
  } catch (error) {
    // การบันทึกหลักฐานต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
    console.warn('Rejected slip record warning:', error.message);
@@ -896,10 +903,14 @@ async function recordRejectedSlip({
    await sendMerchantNotification({
      merchantId,
      sourceType: 'payment_slip_rejected',
-     sourceId: orderId,
+     sourceId: `${orderId}:${slipNotificationId}`,
      title: 'ตรวจพบสลิปผิดปกติ',
      message: `ออเดอร์ #${orderId}: ${String(reason || 'ระบบตรวจพบสลิปผิดปกติ')}`,
-     data: { order_id: orderId, payment_status: 'REJECTED' },
+     data: {
+       order_id: orderId,
+       slip_id: slipNotificationId,
+       payment_status: 'REJECTED',
+     },
    });
  } catch (error) {
    console.warn('Rejected slip notification warning:', error.message);
