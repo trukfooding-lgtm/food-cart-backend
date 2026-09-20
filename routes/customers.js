@@ -5,6 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { sendMerchantNotification } = require('../services/merchant_push_notification');
+const { getActiveSuspension } = require('../services/account_status');
 
 // ==========================================================
 // ตั้งค่าโฟลเดอร์ uploads สำหรับเก็บรูปโปรไฟล์
@@ -163,6 +164,16 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({
         message:
           'รหัสผ่านไม่ถูกต้อง',
+      });
+    }
+
+    const suspension = await getActiveSuspension('customer', customer.customer_id);
+    if (suspension) {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_SUSPENDED',
+        message: `บัญชีถูกระงับเนื่องจาก: ${suspension.reason}`,
+        reason: suspension.reason,
       });
     }
 

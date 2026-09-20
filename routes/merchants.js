@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
+const { getActiveSuspension } = require('../services/account_status');
 installMerchantMap(router);
 
 // ==========================================================
@@ -217,6 +218,16 @@ router.post('/login', async (req, res) => {
     if (password !== merchant.password) {
       return res.status(401).json({
         message: 'รหัสผ่านไม่ถูกต้อง'
+      });
+    }
+
+    const suspension = await getActiveSuspension('merchant', merchant.id);
+    if (suspension) {
+      return res.status(403).json({
+        success: false,
+        code: 'ACCOUNT_SUSPENDED',
+        message: `บัญชีถูกระงับเนื่องจาก: ${suspension.reason}`,
+        reason: suspension.reason,
       });
     }
 

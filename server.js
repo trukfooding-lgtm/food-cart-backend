@@ -7,6 +7,7 @@ const { testConnection } = require('./config/db');
 const customerRoutes = require('./routes/customers');
 const merchantRoutes = require('./routes/merchants');
 const ordersRoutes = require('./routes/orders');
+const internalAccountStatusRoutes = require('./routes/internal_account_status');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,6 +33,7 @@ app.get('/', (req, res) => {
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
 app.use('/api/orders', ordersRoutes);
+app.use('/api/internal', internalAccountStatusRoutes);
 const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
 app.use('/api', paymentRoutes);
 
