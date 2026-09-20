@@ -308,13 +308,31 @@ router.get('/trucks', async (req, res) => {
 
     for (let i = 0; i < merchants.length; i++) {
       const { rows: menus } = await pool.query(
-        `SELECT id, name, price, image_url
-         FROM menus
+        `SELECT id, name, price, quantity, is_available, image_url,
+                option_groups
+         FROM merchant_menus
          WHERE merchant_id = $1`,
         [merchants[i].id]
       );
 
-      merchants[i].items = menus;
+      merchants[i].items = menus.map((menu) => {
+        let optionGroups = [];
+        if (Array.isArray(menu.option_groups)) {
+          optionGroups = menu.option_groups;
+        } else if (typeof menu.option_groups === 'string' && menu.option_groups.trim()) {
+          try {
+            const parsed = JSON.parse(menu.option_groups);
+            if (Array.isArray(parsed)) optionGroups = parsed;
+          } catch (_) {
+            optionGroups = [];
+          }
+        }
+
+        return {
+          ...menu,
+          optionGroups,
+        };
+      });
     }
 
     res.json({
