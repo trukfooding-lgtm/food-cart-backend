@@ -949,6 +949,7 @@ router.post(
       const customerId = order.customer_id;
       const mId = merchantId || order.merchant_id || 1;
       const dbOrderTotal = parseFloat(order.total_price);
+      const normalizedOcrStatus = String(ocrStatus || '').trim().toUpperCase();
 
       // Layer 2: Server-side Fraud Checks บน Transaction ID (ป้องกันการใช้สลิปซ้ำ Replay Attack)
       const normTxId = (transactionId || '')
@@ -1001,7 +1002,7 @@ router.post(
       }
 
       // Layer 4: ตรวจสอบสถานะการคัดกรองเบื้องต้น
-      if (ocrStatus === 'REJECTED') {
+      if (normalizedOcrStatus === 'REJECTED') {
         const reason = 'สลิปไม่ผ่านการตรวจสอบความถูกต้องของระบบธนาคาร';
         await recordRejectedSlip({
           orderId,
@@ -1017,6 +1018,23 @@ router.post(
           success: false,
           status: 'REJECTED',
           message: reason,
+        });
+      }
+
+      // สลิปอ่านไม่ได้: บันทึกหลักฐานให้ร้านค้าตรวจสอบ/รายงาน
+      // แต่คงผลตอบกลับ MANUAL_REVIEW เดิมของฝั่งลูกค้าไว้
+      const isUnreadableSlip = normalizedOcrStatus === 'UNREADABLE';
+      if (isUnreadableSlip) {
+        await recordRejectedSlip({
+          orderId,
+          customerId,
+          merchantId: mId,
+          slipUrl,
+          expectedAmount: dbOrderTotal,
+          detectedAmount: parsedDetectedAmount,
+          reason:
+            'รูปภาพไม่มีหลักฐานหรือสำเนาของธนาคารที่ถูกต้อง (ตรวจพบสลิปไม่แท้หรืออ่านสลิปไม่ได้)',
+          ocrText,
         });
       }
 
@@ -1036,25 +1054,11 @@ router.post(
       }
 
       // Layer 5: จัดการเคสที่ไม่แน่ใจ หรือต้องตรวจสอบเพิ่มเติม (MANUAL_REVIEW)
-      if (ocrStatus === 'MANUAL_REVIEW' || !normTxId) {
-        const isMerchantRejectedSlip =
-          ocrStatus === 'UNREADABLE' || ocrStatus === 'MANUAL_REVIEW';
-        if (isMerchantRejectedSlip) {
-          const reason =
-            ocrStatus === 'MANUAL_REVIEW'
-              ? 'สลิปยังไม่ผ่านการตรวจสอบ กรุณาตรวจสอบหลักฐานการชำระเงิน'
-              : 'รูปภาพไม่มีหลักฐานหรือสำเนาของธนาคารที่ถูกต้อง (ตรวจพบสลิปไม่แท้หรืออ่านสลิปไม่ได้)';
-          await recordRejectedSlip({
-            orderId,
-            customerId,
-            merchantId: mId,
-            slipUrl,
-            expectedAmount: dbOrderTotal,
-            detectedAmount: parsedDetectedAmount,
-            reason,
-            ocrText,
-          });
-        }
+      if (
+        normalizedOcrStatus === 'MANUAL_REVIEW' ||
+        isUnreadableSlip ||
+        !normTxId
+      ) {
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
 
         await sendPushNotification(
@@ -1063,7 +1067,7 @@ router.post(
           `ออเดอร์ #${orderId} ร้านค้ากำลังตรวจสอบหลักฐานการชำระเงินของคุณ`
         );
 
-        if (!isMerchantRejectedSlip && typeof sendMerchantNotification === 'function') {
+        if (!isUnreadableSlip && typeof sendMerchantNotification === 'function') {
           try {
             await sendMerchantNotification({
               merchantId: mId,
