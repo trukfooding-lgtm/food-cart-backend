@@ -1725,8 +1725,10 @@ router.put(
     const {
       status,
       prep_minutes,
-      reject_reason
+      reject_reason,
+      merchant_confirmed_payment
     } = req.body;
+    const merchantConfirmedPayment = merchant_confirmed_payment === true;
 
     const customerStatusByMerchantStatus = {
       'รอชำระเงิน': 'รอชำระเงิน',
@@ -1813,7 +1815,8 @@ router.put(
 
       if (
         (status === 'กำลังปรุง' || status === 'รอรับสินค้า') &&
-        !customerHasPaid
+        !customerHasPaid &&
+        !merchantConfirmedPayment
       ) {
         await connection.query('ROLLBACK');
         return res.status(409).json({
@@ -1824,22 +1827,56 @@ router.put(
       }
 
       if (status === 'กำลังปรุง') {
-        const { rows: verifiedSlips } = await connection.query(
+        const { rows: latestSlips } = await connection.query(
           `SELECT 1
            FROM order_slips
            WHERE order_id = $1
-             AND status = 'VERIFIED'
            ORDER BY created_at DESC
            LIMIT 1`,
           [req.params.orderId]
         );
 
-        if (verifiedSlips.length === 0) {
+        if (latestSlips.length === 0) {
           await connection.query('ROLLBACK');
           return res.status(409).json({
             success: false,
-            message: 'ยังไม่พบสลิปที่ผ่านการตรวจสอบ'
+            message: 'ยังไม่พบหลักฐานสลิปสำหรับยืนยัน'
           });
+        }
+
+        if (merchantConfirmedPayment) {
+          await connection.query(
+            `UPDATE order_slips
+             SET status = 'VERIFIED',
+                 verified_at = COALESCE(verified_at, NOW()),
+                 validation_reason = COALESCE(validation_reason, 'ร้านค้ายืนยันรับเงินด้วยตนเอง')
+             WHERE id = (
+               SELECT id
+               FROM order_slips
+               WHERE order_id = $1
+               ORDER BY created_at DESC
+               LIMIT 1
+             )`,
+            [req.params.orderId]
+          );
+        } else {
+          const { rows: verifiedSlips } = await connection.query(
+            `SELECT 1
+             FROM order_slips
+             WHERE order_id = $1
+               AND status = 'VERIFIED'
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [req.params.orderId]
+          );
+
+          if (verifiedSlips.length === 0) {
+            await connection.query('ROLLBACK');
+            return res.status(409).json({
+              success: false,
+              message: 'ยังไม่พบสลิปที่ผ่านการตรวจสอบ'
+            });
+          }
         }
       }
 
