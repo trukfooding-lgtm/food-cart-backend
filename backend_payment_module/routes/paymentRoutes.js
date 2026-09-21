@@ -11,10 +11,14 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const crypto = require('crypto');
-const fs = require('fs/promises');
-const path = require('path');
 const { generatePromptPayPayload } = require('../services/promptPayService');
 const { sendMerchantNotification } = require('../../services/merchant_push_notification');
+const {
+  SlipStorageError,
+  uploadPaymentSlip,
+  getPaymentSlipUrl,
+  deletePaymentSlip
+} = require('../services/slipStorageService');
 
 const { createWorker } = require('tesseract.js');
 let pool = null;
@@ -53,16 +57,10 @@ const BANK_MAP = {
   'GSB': 'ธนาคารออมสิน'
 };
 
-const slipUploadDirectory = path.resolve(__dirname, '../../uploads/slips');
-
 function normalisePaymentType(value) {
   return String(value || '').trim().toUpperCase() === 'PROMPTPAY'
     ? 'PROMPTPAY'
     : 'BANK_ACCOUNT';
-}
-
-function publicSlipUrl(req, fileName) {
-  return `${req.protocol}://${req.get('host')}/uploads/slips/${fileName}`;
 }
 
 function getFileExtension(file) {
@@ -338,7 +336,7 @@ async function handleGetPaymentInfo(req, res) {
  */
 async function handlePostPaymentSlip(req, res) {
   let connection;
-  let savedFilePath = null;
+  let savedSlipLocation = null;
   try {
     const { orderId } = req.params;
     const cleanOrderId = orderId.toString().replace(/[^0-9]/g, '');
@@ -420,11 +418,13 @@ async function handlePostPaymentSlip(req, res) {
       });
     }
 
-    await fs.mkdir(slipUploadDirectory, { recursive: true });
     const fileName = `order-${cleanOrderId}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${getFileExtension(req.file)}`;
-    savedFilePath = path.join(slipUploadDirectory, fileName);
-    await fs.writeFile(savedFilePath, req.file.buffer);
-    const slipUrl = publicSlipUrl(req, fileName);
+    savedSlipLocation = await uploadPaymentSlip({
+      orderId: cleanOrderId,
+      fileName,
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype
+    });
     const slipStatus = verification.verified ? 'VERIFIED' : 'REJECTED';
 
     await connection.query(
@@ -438,7 +438,7 @@ async function handlePostPaymentSlip(req, res) {
       [
         cleanOrderId,
         order.customer_id,
-        slipUrl,
+        savedSlipLocation,
         verification.detectedAmount,
         expectedAmount,
         verification.detectedAmount,
@@ -507,10 +507,11 @@ async function handlePostPaymentSlip(req, res) {
 
   } catch (error) {
     if (connection) await connection.query('ROLLBACK');
-    if (savedFilePath) await fs.unlink(savedFilePath).catch(() => {});
+    if (savedSlipLocation) await deletePaymentSlip(savedSlipLocation).catch(() => {});
     console.error('❌ [Payment Verification Failed]: ' + error.message);
-    return res.status(400).json({
+    return res.status(error instanceof SlipStorageError ? 503 : 400).json({
       success: false,
+      code: error.code,
       message: error.message
     });
   } finally {
@@ -542,19 +543,20 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'ไม่พบหลักฐานการชำระเงิน' });
     }
-    return res.json({ success: true, data: rows[0] });
+    const slipUrl = await getPaymentSlipUrl(rows[0].slip_url);
+    return res.json({ success: true, data: { ...rows[0], slip_url: slipUrl } });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// ร้านรายงานเฉพาะสลิปที่ระบบตรวจไม่ผ่าน โดยไม่ใช่การยืนยันชำระเงิน
+// ร้านรายงานสลิปย้อนหลังได้ทุกสถานะ โดยไม่ใช่การยืนยันชำระเงิน
 router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async (req, res) => {
   try {
     const orderId = String(req.params.orderId).replace(/[^0-9]/g, '');
     const { rows } = await pool.query(
       `SELECT COALESCE(o.customer_id, mo.customer_id) AS customer_id,
-              os.validation_reason
+              os.validation_reason, os.status
        FROM order_slips os
        LEFT JOIN orders o ON o.id::text = os.order_id
        LEFT JOIN merchant_orders mo
@@ -562,16 +564,17 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async 
         AND mo.merchant_id = $2
        WHERE os.order_id = $1
          AND COALESCE(o.merchant_id, mo.merchant_id) = $2
-         AND os.status = 'REJECTED'
        ORDER BY os.created_at DESC
        LIMIT 1`,
       [orderId, req.params.merchantId]
     );
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'ไม่พบสลิปผิดปกติสำหรับออเดอร์นี้' });
+      return res.status(404).json({ success: false, message: 'ไม่พบสลิปสำหรับออเดอร์นี้' });
     }
 
-    const reason = rows[0].validation_reason || 'ระบบตรวจพบสลิปผิดปกติ';
+    const reason = rows[0].status === 'REJECTED'
+      ? (rows[0].validation_reason || 'ระบบตรวจพบสลิปผิดปกติ')
+      : 'ร้านรายงานว่ายังไม่พบยอดชำระเงิน กรุณาตรวจสอบรายการโอนและหลักฐานอีกครั้ง';
     await pool.query(
       `INSERT INTO merchant_issue_reports
         (merchant_id, issue_type, order_reference, details, status)
