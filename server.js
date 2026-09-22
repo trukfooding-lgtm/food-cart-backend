@@ -16,7 +16,11 @@ const smtpPass = process.env.SMTP_PASS?.trim();
 const smtpFrom = process.env.SMTP_FROM?.trim();
 
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
+  requireTLS: true,
+  family: 4,
   auth: {
     user: smtpUser,
     pass: smtpPass,
