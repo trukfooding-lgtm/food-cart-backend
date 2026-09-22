@@ -592,6 +592,72 @@ router.post('/review', async (req, res) => {
 // ==========================================================
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs/promises');
+
+// Menu images are kept in Supabase Storage when the server has its private
+// service-role key. The existing local uploads path remains available as a
+// fallback so existing clients and old records keep working unchanged.
+const MENU_IMAGE_BUCKET = 'menu-images';
+
+function getSupabaseProjectUrl() {
+ const configuredUrl = String(
+  process.env.SUPABASE_URL ||
+  process.env.SUPABASE_PROJECT_URL ||
+  ''
+ ).trim().replace(/\/+$/, '');
+
+ if (configuredUrl) return configuredUrl;
+
+ // The Supabase project reference is also present in the pooled database
+ // username (postgres.<project-ref>). This keeps deployment configuration
+ // small without exposing any credential in the app.
+ try {
+  const databaseUrl = new URL(process.env.DATABASE_URL || '');
+  const username = decodeURIComponent(databaseUrl.username || '');
+  const match = username.match(/^postgres\.([a-z0-9]+)$/i);
+  return match ? `https://${match[1]}.supabase.co` : '';
+ } catch (_) {
+  return '';
+ }
+}
+
+function getSupabaseMenuImageUrl(filename) {
+ const projectUrl = getSupabaseProjectUrl();
+ if (!projectUrl || !filename) return '';
+ return `${projectUrl}/storage/v1/object/public/${MENU_IMAGE_BUCKET}/${encodeURIComponent(filename)}`;
+}
+
+async function uploadMenuImageToSupabase(file) {
+ const projectUrl = getSupabaseProjectUrl();
+ const serviceRoleKey = String(
+  process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+ ).trim();
+
+ // Keep the original local-upload behaviour when the private server secret
+ // is not configured yet. Render can enable permanent storage by adding the
+ // secret without requiring any client-side change.
+ if (!projectUrl || !serviceRoleKey || !file || !file.filename) {
+  return null;
+ }
+
+ const objectUrl = `${projectUrl}/storage/v1/object/${MENU_IMAGE_BUCKET}/${encodeURIComponent(file.filename)}`;
+ const response = await fetch(objectUrl, {
+  method: 'POST',
+  headers: {
+   apikey: serviceRoleKey,
+   Authorization: `Bearer ${serviceRoleKey}`,
+   'Content-Type': file.mimetype || 'application/octet-stream',
+   'x-upsert': 'true',
+  },
+  body: await fs.readFile(file.path),
+ });
+
+ if (!response.ok) {
+  throw new Error(`Supabase Storage upload failed (${response.status})`);
+ }
+
+ return getSupabaseMenuImageUrl(file.filename);
+}
 
 const storage = multer.diskStorage({
  destination: function (
@@ -624,9 +690,9 @@ const upload = multer({
 router.post(
  '/upload-image',
  upload.single('image'),
- function (req, res) {
+ async function (req, res) {
  if (!req.file) {
- return res.status(400).json({
+  return res.status(400).json({
  success: false,
  message:
  'No file uploaded',
@@ -637,10 +703,54 @@ router.post(
  `${req.protocol}://${req.get('host')}` +
  `/uploads/${req.file.filename}`;
 
+ let permanentImageUrl = imageUrl;
+ try {
+  const uploadedUrl = await uploadMenuImageToSupabase(req.file);
+  if (uploadedUrl) permanentImageUrl = uploadedUrl;
+ } catch (error) {
+  // Do not break the existing upload flow if Storage is unavailable. The
+  // local URL is still returned and can be resolved after Storage is enabled.
+  console.warn('Menu image Storage upload warning:', error.message);
+ }
+
  res.json({
- success: true,
- url: imageUrl,
+  success: true,
+  url: permanentImageUrl,
+  local_url: imageUrl,
  });
+ }
+);
+
+// Resolve old menu image values (bare filenames or /uploads/... URLs) to the
+// permanent public Storage object without changing existing database rows.
+router.get(
+ '/menu-image/:filename',
+ async function (req, res) {
+  const requestedFilename = String(req.params.filename || '');
+  const filename = path.basename(requestedFilename);
+
+  if (
+   !filename ||
+   filename !== requestedFilename ||
+   filename.includes('..')
+  ) {
+   return res.status(400).json({
+    success: false,
+    message: 'Invalid image filename',
+   });
+  }
+
+  const permanentUrl = getSupabaseMenuImageUrl(filename);
+  if (permanentUrl) {
+   // The bucket is public and the browser performs the real GET request.
+   // Avoid a preliminary HEAD request because Storage/proxies may reject
+   // HEAD even when the image itself is available.
+   return res.redirect(302, permanentUrl);
+  }
+
+  // Preserve the pre-existing local upload path as a fallback for old files
+  // that have not been copied to Storage yet.
+  return res.redirect(302, `/uploads/${encodeURIComponent(filename)}`);
  }
 );
 
