@@ -11,13 +11,19 @@ const internalAccountStatusRoutes = require('./routes/internal_account_status');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const smtpUser = process.env.SMTP_USER?.trim();
+const smtpPass = process.env.SMTP_PASS?.trim();
+const smtpFrom = process.env.SMTP_FROM?.trim();
 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
-  auth: { 
-    user: process.env.SMTP_USER, 
-    pass: process.env.SMTP_PASS 
+  auth: {
+    user: smtpUser,
+    pass: smtpPass,
   },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 15000,
 });
 
 const otpStore = {};
@@ -38,12 +44,21 @@ const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
 app.use('/api', paymentRoutes);
 
 app.post('/api/otp/send', async (req, res) => {
-  const { email } = req.body;
+  const recipientEmail =
+    typeof req.body?.email === 'string' ? req.body.email.trim() : '';
 
-  if (!email) {
+  if (!recipientEmail) {
     return res.status(400).json({
       success: false,
       message: 'กรุณาระบุอีเมล'
+    });
+  }
+
+  if (!smtpUser || !smtpPass) {
+    console.error('OTP email is unavailable: SMTP_USER/SMTP_PASS is not configured');
+    return res.status(503).json({
+      success: false,
+      message: 'ระบบส่งอีเมลยังไม่ได้ตั้งค่า กรุณาติดต่อผู้ดูแลระบบ'
     });
   }
 
@@ -51,17 +66,10 @@ app.post('/api/otp/send', async (req, res) => {
     100000 + Math.random() * 900000
   ).toString();
 
-  otpStore[email] = {
-    code: otp,
-    expiresAt: Date.now() + (5 * 60 * 1000)
-  };
-
   try {
     await transporter.sendMail({
-      from:
-        process.env.SMTP_FROM ||
-        '"Food Cart App" <no-reply@gmail.com>',
-      to: email,
+      from: smtpFrom || '"Food Cart App" <no-reply@gmail.com>',
+      to: recipientEmail,
       subject:
         'รหัส OTP สำหรับตั้งรหัสผ่านใหม่ (Food Cart App)',
       html:
@@ -72,15 +80,22 @@ app.post('/api/otp/send', async (req, res) => {
         '<p>รหัสนี้มีอายุ 5 นาที</p>',
     });
 
+    otpStore[recipientEmail] = {
+      code: otp,
+      expiresAt: Date.now() + (5 * 60 * 1000)
+    };
+
     res.json({
       success: true,
       message: 'ส่ง OTP ไปยังอีเมลแล้ว!'
     });
   } catch (error) {
-    console.error(
-      'Nodemailer Error: ',
-      error
-    );
+    console.error('Nodemailer Error:', {
+      code: error.code,
+      responseCode: error.responseCode,
+      response: error.response,
+      message: error.message,
+    });
 
     res.status(500).json({
       success: false,
