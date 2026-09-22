@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
-const nodemailer = require('nodemailer');
 
 const { testConnection } = require('./config/db');
 const customerRoutes = require('./routes/customers');
@@ -11,26 +10,46 @@ const internalAccountStatusRoutes = require('./routes/internal_account_status');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const smtpUser = process.env.SMTP_USER?.trim();
-const smtpPass = process.env.SMTP_PASS?.trim();
-const smtpFrom = process.env.SMTP_FROM?.trim();
-
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  family: 4,
-  auth: {
-    user: smtpUser,
-    pass: smtpPass,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000,
-});
+const brevoApiKey = process.env.BREVO_API_KEY?.trim();
+const brevoSenderEmail = process.env.BREVO_SENDER_EMAIL?.trim();
+const brevoSenderName = process.env.BREVO_SENDER_NAME?.trim() || 'Food Cart App';
 
 const otpStore = {};
+
+async function sendOtpEmail(recipientEmail, otp) {
+  const brevoResponse = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'api-key': brevoApiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: {
+        email: brevoSenderEmail,
+        name: brevoSenderName,
+      },
+      to: [{ email: recipientEmail }],
+      subject: 'รหัส OTP สำหรับตั้งรหัสผ่านใหม่ (Food Cart App)',
+      htmlContent:
+        '<h2>รหัสยืนยันตัวตนของคุณคือ</h2>' +
+        '<h1 style="color: #00C7E6;">' +
+        otp +
+        '</h1>' +
+        '<p>รหัสนี้มีอายุ 5 นาที</p>',
+    }),
+  });
+
+  if (brevoResponse.ok) {
+    return true;
+  }
+
+  console.error('Brevo OTP Error:', {
+    status: brevoResponse.status,
+    response: await brevoResponse.text(),
+  });
+  return false;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -58,8 +77,8 @@ app.post('/api/otp/send', async (req, res) => {
     });
   }
 
-  if (!smtpUser || !smtpPass) {
-    console.error('OTP email is unavailable: SMTP_USER/SMTP_PASS is not configured');
+  if (!brevoApiKey || !brevoSenderEmail) {
+    console.error('OTP email is unavailable: Brevo environment variables are not configured');
     return res.status(503).json({
       success: false,
       message: 'ระบบส่งอีเมลยังไม่ได้ตั้งค่า กรุณาติดต่อผู้ดูแลระบบ'
@@ -71,18 +90,12 @@ app.post('/api/otp/send', async (req, res) => {
   ).toString();
 
   try {
-    await transporter.sendMail({
-      from: smtpFrom || '"Food Cart App" <no-reply@gmail.com>',
-      to: recipientEmail,
-      subject:
-        'รหัส OTP สำหรับตั้งรหัสผ่านใหม่ (Food Cart App)',
-      html:
-        '<h2>รหัสยืนยันตัวตนของคุณคือ</h2>' +
-        '<h1 style="color: #00C7E6;">' +
-        otp +
-        '</h1>' +
-        '<p>รหัสนี้มีอายุ 5 นาที</p>',
-    });
+    if (!await sendOtpEmail(recipientEmail, otp)) {
+      return res.status(500).json({
+        success: false,
+        message: 'ไม่สามารถส่งอีเมลได้'
+      });
+    }
 
     otpStore[recipientEmail] = {
       code: otp,
@@ -94,12 +107,7 @@ app.post('/api/otp/send', async (req, res) => {
       message: 'ส่ง OTP ไปยังอีเมลแล้ว!'
     });
   } catch (error) {
-    console.error('Nodemailer Error:', {
-      code: error.code,
-      responseCode: error.responseCode,
-      response: error.response,
-      message: error.message,
-    });
+    console.error('Brevo OTP Error:', error.message);
 
     res.status(500).json({
       success: false,
