@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../config/db');
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
 const { getActiveSuspension } = require('../services/account_status');
+const { normalizeMenuImageFields, normalizeUploadImageUrl } = require('../services/menuImageUrlService');
 installMerchantMap(router);
 
 function toPositiveInt(value, fallback = 0) {
@@ -382,7 +383,7 @@ router.get('/trucks', async (req, res) => {
         }
 
         return {
-          ...menu,
+          ...normalizeMenuImageFields(menu),
           optionGroups,
         };
       });
@@ -1190,7 +1191,7 @@ router.get('/:id/menus', async (req, res) => {
 
     res.json({
       success: true,
-      data: rows
+      data: rows.map((menu) => normalizeMenuImageFields(menu))
     });
   } catch (error) {
     console.error(
@@ -1248,7 +1249,7 @@ router.post('/:id/menus', async (req, res) => {
         Number(price),
         Number(quantity),
         is_available ? 1 : 0,
-        image_url || null,
+        normalizeUploadImageUrl(image_url) || null,
         JSON.stringify(
           option_groups || []
         )
@@ -1302,7 +1303,7 @@ router.put(
             Number(price),
             Number(quantity),
             is_available ? 1 : 0,
-            image_url || null,
+            normalizeUploadImageUrl(image_url) || null,
             JSON.stringify(
               option_groups || []
             ),
