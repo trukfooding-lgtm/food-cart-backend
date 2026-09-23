@@ -161,7 +161,7 @@ async function awardOrderPointsOnce(connection, orderId) {
    LEFT JOIN merchant_loyalty_settings mls
      ON mls.merchant_id = o.merchant_id
    WHERE o.id = $1
-   FOR UPDATE`,
+   FOR UPDATE OF o`,
   [orderId]
  );
 
