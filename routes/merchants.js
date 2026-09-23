@@ -1023,10 +1023,12 @@ router.put(
            points_for_discount =
              EXCLUDED.points_for_discount,
            discount_amount =
-             EXCLUDED.discount_amount`,
+             EXCLUDED.discount_amount,
+           updated_at =
+             NOW()`,
         [
           req.params.id,
-          is_enabled ? 1 : 0,
+          is_enabled,
           baht,
           points,
           discount
