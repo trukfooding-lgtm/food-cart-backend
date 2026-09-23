@@ -5,6 +5,59 @@ const { installMerchantMap, expireStores } = require('../services/merchant_map')
 const { getActiveSuspension } = require('../services/account_status');
 installMerchantMap(router);
 
+function toPositiveInt(value, fallback = 0) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
+}
+
+async function refundOrderPointsOnce(connection, orderId) {
+  const { rows } = await connection.query(
+    `SELECT
+       id,
+       customer_id,
+       merchant_id,
+       COALESCE(points_used, 0) AS points_used,
+       points_refunded_at
+     FROM orders
+     WHERE id = $1
+     FOR UPDATE`,
+    [orderId]
+  );
+
+  if (rows.length === 0) return false;
+  const order = rows[0];
+  const pointsUsed = toPositiveInt(order.points_used, 0);
+  if (pointsUsed <= 0 || order.points_refunded_at) return false;
+
+  await connection.query(
+    `INSERT INTO customer_merchant_points
+      (customer_id, merchant_id, points_balance)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (customer_id, merchant_id)
+     DO UPDATE SET
+       points_balance = customer_merchant_points.points_balance + EXCLUDED.points_balance,
+       updated_at = NOW()`,
+    [order.customer_id, order.merchant_id, pointsUsed]
+  );
+
+  await connection.query(
+    `INSERT INTO customer_point_transactions
+      (customer_id, merchant_id, order_id, type, points, amount, note)
+     VALUES ($1, $2, $3, 'REFUND', $4, 0, 'คืนแต้มจากคำสั่งซื้อที่ถูกยกเลิก')`,
+    [order.customer_id, order.merchant_id, orderId, pointsUsed]
+  );
+
+  await connection.query(
+    `UPDATE orders
+     SET points_refunded_at = NOW()
+     WHERE id = $1`,
+    [orderId]
+  );
+
+  return true;
+}
+
 // ==========================================================
 // POST /api/merchants/register -> สมัครสมาชิกผู้ค้า
 // ==========================================================
@@ -1612,6 +1665,11 @@ router.get('/:id/orders', async (req, res) => {
              '-'
            ) AS items_summary,
            o.total_price,
+           o.original_total,
+           o.points_used,
+           o.points_discount,
+           o.final_total,
+           o.loyalty_rate_snapshot,
            COALESCE(
              mo.merchant_status,
              CASE
@@ -1655,25 +1713,7 @@ router.get('/:id/orders', async (req, res) => {
              THEN o.payment_deadline
              ELSE NULL
            END AS payment_deadline,
-           COALESCE(
-             to_jsonb(o)->>'customer_points',
-             to_jsonb(o)->>'points_balance',
-             to_jsonb(o)->>'points_remaining',
-             to_jsonb(o)->>'loyalty_points',
-             to_jsonb(o)->>'reward_points'
-           ) AS customer_points,
-           COALESCE(
-             to_jsonb(o)->>'points_used',
-             to_jsonb(o)->>'used_points',
-             to_jsonb(o)->>'points_redeemed',
-             to_jsonb(o)->>'redeemed_points'
-           ) AS points_used,
-           COALESCE(
-             to_jsonb(o)->>'points_discount',
-             to_jsonb(o)->>'points_discount_amount',
-             to_jsonb(o)->>'redeemed_amount',
-             to_jsonb(o)->>'discount_from_points'
-           ) AS points_discount
+           cmp.points_balance AS customer_points
 
          FROM orders o
 
@@ -1683,6 +1723,10 @@ router.get('/:id/orders', async (req, res) => {
          LEFT JOIN merchant_orders mo
            ON o.id = mo.source_order_id
           AND o.merchant_id = mo.merchant_id
+
+         LEFT JOIN customer_merchant_points cmp
+           ON cmp.customer_id = o.customer_id
+          AND cmp.merchant_id = o.merchant_id
 
          WHERE o.merchant_id = $1
 
@@ -1968,6 +2012,10 @@ router.put(
           message:
             'ไม่พบออเดอร์ฝั่งลูกค้า'
         });
+      }
+
+      if (status === 'ยกเลิก') {
+        await refundOrderPointsOnce(connection, req.params.orderId);
       }
 
       await connection.query('COMMIT');

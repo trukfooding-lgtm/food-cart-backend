@@ -298,6 +298,71 @@ router.get('/', async (req, res) => {
 });
 
 // ==========================================================
+// GET /api/customers/:id/points
+// แต้มสะสมของลูกค้า แยกตามร้านค้า
+// ==========================================================
+router.get('/:id/points', async (req, res) => {
+  try {
+    const customerId = req.params.id;
+
+    const { rows: balances } = await pool.query(
+      `SELECT
+         m.id AS merchant_id,
+         m.name AS merchant_name,
+         COALESCE(cmp.points_balance, 0) AS points_balance,
+         COALESCE(mls.is_enabled, 0) AS is_enabled,
+         COALESCE(mls.baht_per_point, 0) AS baht_per_point,
+         COALESCE(mls.points_for_discount, 0) AS points_for_discount,
+         COALESCE(mls.discount_amount, 0) AS discount_amount
+       FROM merchant m
+       LEFT JOIN customer_merchant_points cmp
+         ON cmp.merchant_id = m.id
+        AND cmp.customer_id = $1
+       LEFT JOIN merchant_loyalty_settings mls
+         ON mls.merchant_id = m.id
+       WHERE COALESCE(cmp.points_balance, 0) > 0
+          OR COALESCE(mls.is_enabled, 0) = 1
+       ORDER BY COALESCE(cmp.points_balance, 0) DESC, m.name ASC`,
+      [customerId]
+    );
+
+    const { rows: transactions } = await pool.query(
+      `SELECT
+         cpt.id,
+         cpt.merchant_id,
+         m.name AS merchant_name,
+         cpt.order_id,
+         cpt.type,
+         cpt.points,
+         cpt.amount,
+         cpt.note,
+         cpt.created_at
+       FROM customer_point_transactions cpt
+       LEFT JOIN merchant m ON m.id = cpt.merchant_id
+       WHERE cpt.customer_id = $1
+       ORDER BY cpt.created_at DESC
+       LIMIT 100`,
+      [customerId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        balances,
+        transactions,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching customer points:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถโหลดแต้มสะสมได้',
+      error: error.message,
+    });
+  }
+});
+
+// ==========================================================
 // 5. GET /api/customers/:id
 // ดูข้อมูลลูกค้ารายคน
 // ==========================================================
