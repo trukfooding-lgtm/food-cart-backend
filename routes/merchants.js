@@ -1818,6 +1818,7 @@ router.put(
       const { rows: customerOrders } =
         await connection.query(
           `SELECT
+             o.customer_id,
              o.status,
              o.transaction_id,
              (
@@ -2016,7 +2017,20 @@ router.put(
             'ไม่พบออเดอร์ฝั่งลูกค้า'
         });
       }
-
+      if (
+        status === 'รอรับสินค้า' &&
+        customerOrder.merchant_status !== 'รอรับสินค้า'
+      ) {
+  await connection.query(
+    `INSERT INTO notifications (user_id, title, body)
+     VALUES ($1, $2, $3)`,
+    [
+      customerOrder.customer_id,
+      'ออเดอร์พร้อมรับแล้ว',
+      `ออเดอร์ #${req.params.orderId} ทางร้านอัปเดตเป็นพร้อมรับ สามารถไปรับอาหารได้เลย`
+    ]
+  );
+}
       if (status === 'ยกเลิก') {
         await refundOrderPointsOnce(connection, req.params.orderId);
       }
