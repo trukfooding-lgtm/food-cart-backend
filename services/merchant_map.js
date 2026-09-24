@@ -1,4 +1,29 @@
 const { pool } = require('../config/db');
+async function notifyFollowersOfStoreStatus(
+  client,
+  {
+    merchantId,
+    merchantName,
+    previousStatus,
+    currentStatus,
+    scheduled,
+    locationName
+  }
+) {
+  if (scheduled || previousStatus === currentStatus) return;
+  if (currentStatus !== 'เปิดร้าน' && currentStatus !== 'กำลังย้าย') return;
+  const isMoving = currentStatus === 'กำลังย้าย';
+  const title = isMoving ? 'ร้านที่คุณติดตามกำลังย้าย' : 'ร้านที่คุณติดตามเปิดขายแล้ว';
+  const body = isMoving
+    ? `ร้าน ${merchantName || ''} กำลังย้ายจุดขาย`
+    : `ร้าน ${merchantName || ''} เปิดขายแล้วนะ 📍 อยู่ที่ ${locationName || 'จุดขาย'}`;
+  await client.query(
+    `INSERT INTO notifications (user_id,title,body)
+     SELECT DISTINCT customer_id, $2, $3 FROM followed WHERE merchant_id = $1`,
+    [merchantId, title, body]
+  );
+}
+
 async function expireStores() {
   await pool.query(
     'SELECT public.expire_merchant_sessions_and_cancel_uncollected_orders()'
@@ -34,7 +59,7 @@ function installMerchantMap(router) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const merchant = await client.query('SELECT id FROM merchant WHERE id=$1 FOR UPDATE',[req.params.id]);
+      const merchant = await client.query('SELECT id, name FROM merchant WHERE id=$1 FOR UPDATE',[req.params.id]);
       if (!merchant.rowCount) { await client.query('ROLLBACK'); return res.status(404).json({success:false,message:'ไม่พบร้านค้า'}); }
       await client.query(`UPDATE merchant_status SET status='ปิดร้าน', updated_at=CURRENT_TIMESTAMP WHERE merchant_id=$1 AND selling_ends_at<=CURRENT_TIMESTAMP`,[req.params.id]);
       const {rows} = await client.query('SELECT * FROM merchant_status WHERE merchant_id=$1',[req.params.id]);
@@ -82,12 +107,14 @@ function installMerchantMap(router) {
           status==='เปิดร้าน'&&hasPoint?longitude:previous?.longitude??null,
           status==='เปิดร้าน'&&hasPoint?String(location_name||'จุดขาย'):previous?.location_name??null,
           starts??null,status==='ปิดร้าน'?null:ends]);
-      if (status === 'เปิดร้าน' && !scheduled) {
-        await client.query(`INSERT INTO notifications (user_id,title,body)
-          SELECT DISTINCT customer_id, $2, $3 FROM followed WHERE merchant_id = $1`,
-          [req.params.id, 'ร้านรถเข็นที่คุณติดตามเปิดขายแล้ว',
-            `ร้าน ${merchant.rows[0]?.name || ''} เปิดขายแล้วนะ 📍 อยู่ที่ ${location_name || previous?.location_name || 'จุดขาย'}`]);
-      }
+      await notifyFollowersOfStoreStatus(client, {
+        merchantId: req.params.id,
+        merchantName: merchant.rows[0]?.name,
+        previousStatus: previous?.status,
+        currentStatus: effectiveStatus,
+        scheduled,
+        locationName: location_name || previous?.location_name
+      });
       await client.query('COMMIT');
       res.json({success:true,status:effectiveStatus,scheduled_open:scheduled,message:'บันทึกรอบขายสำเร็จ'});
     } catch(e) { await client.query('ROLLBACK'); res.status(500).json({success:false,message:'บันทึกจุดขายไม่สำเร็จ'}); }
