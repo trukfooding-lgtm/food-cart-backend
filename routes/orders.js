@@ -1166,8 +1166,61 @@ function parsedFloatOrNull(value) {
  return Number.isFinite(parsed) ? parsed : null;
 }
 
+// เก็บหลักฐานสลิปไว้ให้ร้านค้าเปิดตรวจสอบย้อนหลังได้
+// โดยไม่ลบหลักฐานเดิม และไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้วเอง
+async function insertSlipRecord({
+ orderId,
+ customerId,
+ slipUrl,
+ expectedAmount,
+ detectedAmount,
+ status,
+ reason,
+ ocrText,
+ transactionId,
+ verifiedAt = null,
+ throwOnError = false,
+}) {
+ const fallbackSlipId = `${status}_${orderId}_${Date.now()}`;
+
+ try {
+   const { rows: insertedSlipRows } = await pool.query(
+     `INSERT INTO order_slips
+       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
+        detected_amount, status, note, validation_reason, ocr_text,
+        transaction_id, payment_channel, verified_at)
+      VALUES
+       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, $7, $8, $8, $9,
+        $10, NULL, $11)
+       RETURNING id`,
+     [
+       String(orderId),
+       customerId,
+       slipUrl,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       Number.isFinite(expectedAmount) ? expectedAmount : null,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       status,
+       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
+       String(ocrText || '').slice(0, 8000),
+       transactionId || `${status}_${orderId}_${Date.now()}`,
+       verifiedAt,
+     ],
+   );
+
+   return insertedSlipRows[0]?.id != null
+     ? String(insertedSlipRows[0].id)
+     : fallbackSlipId;
+ } catch (error) {
+   if (throwOnError) throw error;
+   // การบันทึกหลักฐานสลิปผิดปกติต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
+   console.warn('Slip record warning:', error.message);
+   return fallbackSlipId;
+ }
+}
+
 // เก็บสลิปที่ตรวจไม่ผ่านไว้ให้ร้านค้าเปิดตรวจสอบและรายงานได้
-// โดยไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้ว
+// โดยคงพฤติกรรมแจ้งเตือนร้านเดิมไว้
 async function recordRejectedSlip({
  orderId,
  customerId,
@@ -1177,39 +1230,18 @@ async function recordRejectedSlip({
  detectedAmount,
  reason,
  ocrText,
- }) {
- let slipNotificationId = `attempt-${Date.now()}`;
-
- try {
-   const { rows: insertedSlipRows } = await pool.query(
-     `INSERT INTO order_slips
-       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
-        detected_amount, status, note, validation_reason, ocr_text,
-        transaction_id, payment_channel, verified_at)
-      VALUES
-       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, 'REJECTED', $7, $7, $8,
-        $9, NULL, NULL)
-       RETURNING id`,
-     [
-       String(orderId),
-       customerId,
-       slipUrl,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       Number.isFinite(expectedAmount) ? expectedAmount : null,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
-       String(ocrText || '').slice(0, 8000),
-       `REJECTED_${orderId}_${Date.now()}`,
-     ],
-   );
-
-   if (insertedSlipRows[0]?.id != null) {
-     slipNotificationId = String(insertedSlipRows[0].id);
-   }
- } catch (error) {
-   // การบันทึกหลักฐานต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
-   console.warn('Rejected slip record warning:', error.message);
- }
+}) {
+ const slipNotificationId = await insertSlipRecord({
+   orderId,
+   customerId,
+   slipUrl,
+   expectedAmount,
+   detectedAmount,
+   status: 'REJECTED',
+   reason,
+   ocrText,
+   transactionId: `REJECTED_${orderId}_${Date.now()}`,
+ });
 
  try {
    await sendMerchantNotification({
@@ -1390,6 +1422,23 @@ router.post(
       ) {
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
 
+        // กรณีที่ยังไม่ผ่านการตรวจสอบอัตโนมัติ ต้องเก็บสลิปไว้ให้ร้านค้า
+        // เปิดดูและตัดสินใจได้ โดยไม่เรียกแจ้งเตือนซ้ำกับกรณี UNREADABLE
+        let reviewSlipId;
+        if (!isUnreadableSlip) {
+          reviewSlipId = await insertSlipRecord({
+            orderId,
+            customerId,
+            slipUrl,
+            expectedAmount: dbOrderTotal,
+            detectedAmount: parsedDetectedAmount,
+            status: 'REJECTED',
+            reason: 'สลิปยังไม่ผ่านการตรวจสอบอัตโนมัติ กรุณาให้ร้านค้าตรวจสอบ',
+            ocrText,
+            transactionId: `REJECTED_${orderId}_${Date.now()}`,
+          });
+        }
+
         await sendPushNotification(
           customerId,
           'กำลังตรวจสอบสลิป',
@@ -1401,9 +1450,14 @@ router.post(
             await sendMerchantNotification({
               merchantId: mId,
               sourceType: 'payment_slip_review',
-              sourceId: orderId,
+              sourceId: `${orderId}:${reviewSlipId || 'latest'}`,
               title: 'มีสลิปรอตรวจสอบ',
               message: `ออเดอร์ #${orderId} ลูกค้าแนบสลิปแล้ว กรุณาตรวจสอบยอดเงิน ฿${dbOrderTotal.toFixed(2)}`,
+              data: {
+                order_id: orderId,
+                slip_id: reviewSlipId,
+                payment_status: 'REJECTED',
+              },
             });
           } catch (e) {
             console.warn('Merchant notification warning:', e.message);
@@ -1418,14 +1472,30 @@ router.post(
       }
 
       // Layer 6: เมื่อผ่านครบทุกชั้นอย่างสมบูรณ์ (VERIFIED)
+      // บันทึกสลิปก่อนเปลี่ยนสถานะออเดอร์ เพื่อให้ร้านเปิดดูย้อนหลัง
+      // และรายงานได้ แม้ระบบจะตรวจผ่านอัตโนมัติแล้ว
+      await insertSlipRecord({
+        orderId,
+        customerId,
+        slipUrl,
+        expectedAmount: dbOrderTotal,
+        detectedAmount: parsedDetectedAmount,
+        status: 'VERIFIED',
+        reason: 'ระบบตรวจสอบสลิปผ่านแล้ว',
+        ocrText,
+        transactionId: transactionId || `VERIFIED_${orderId}_${Date.now()}`,
+        verifiedAt: new Date(),
+        throwOnError: true,
+      });
       usedSlipTransactions.add(normTxId);
       await updateOrderStatusSafely('ชำระเงินแล้ว');
       await pool.query(
         `UPDATE merchant_orders
-         SET merchant_status = 'ชำระเงินแล้ว',
+         SET merchant_status = 'กำลังปรุง',
              updated_at = NOW()
          WHERE source_order_id = $1
-           AND merchant_id = $2`,
+           AND merchant_id = $2
+           AND merchant_status IN ('รอชำระเงิน', 'ชำระเงินแล้ว')`,
         [orderId, mId]
       );
 
