@@ -123,6 +123,25 @@ async function performServerOcr(imageBuffer, expectedAmount) {
   }
 }
 
+function normalizeRecipientText(value) {
+  return String(value || '').toLocaleLowerCase('th-TH').replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+function recipientMatchesSlip(ocrText, merchant) {
+  const normalizedText = normalizeRecipientText(ocrText);
+  const textDigits = String(ocrText || '').replace(/\D/g, '');
+  const names = [
+    merchant?.recipientName,
+    merchant?.name
+  ].map(normalizeRecipientText).filter(name => name.length >= 4);
+  const identifiers = (merchant?.recipientIdentifiers || [])
+    .map(value => String(value || '').replace(/\D/g, ''))
+    .filter(value => value.length >= 4);
+
+  if (names.some(name => normalizedText.includes(name))) return true;
+  return identifiers.some(identifier => textDigits.includes(identifier.slice(-4)));
+}
+
 function evaluateClientOcr({ expectedAmount, detectedAmount, ocrStatus, ocrText }) {
   const detected = Number(detectedAmount);
   const isAmountMatch = Number.isFinite(detected) &&
@@ -208,12 +227,14 @@ async function getMerchantPaymentConfig(merchantId) {
         const bankCode = (acc.bank_code || acc.bank || 'KBANK').toUpperCase();
         const bankName = acc.bank_name || BANK_MAP[bankCode] || 'ธนาคารกสิกรไทย';
         const accNo = acc.account_number || acc.account_no || '';
-        const accName = acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
+        const accName = acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
         const promptpay = acc.promptpay_id || acc.promptpay_number || acc.promptpay || '';
 
         return {
           id: cleanId,
           name: merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck',
+          recipientName: acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || '',
+          recipientIdentifiers: [paymentType === 'PROMPTPAY' ? promptpay : accNo],
           primaryChannel: paymentType,
           promptpay: paymentType === 'PROMPTPAY' ? promptpay : '',
           bankAccount: paymentType === 'BANK_ACCOUNT' && accNo ? {
@@ -233,6 +254,8 @@ async function getMerchantPaymentConfig(merchantId) {
   return {
     id: cleanId,
     name: 'ร้านค้า',
+    recipientName: '',
+    recipientIdentifiers: [],
     promptpay: '',
     primaryChannel: null,
     bankAccount: null
@@ -403,6 +426,12 @@ async function handlePostPaymentSlip(req, res) {
       reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาแนบสลิปจริงที่ชัดเจน'
     };
 
+    if (verification.verified && !recipientMatchesSlip(verification.ocrText, merchant)) {
+      verification.verified = false;
+      verification.ocrStatus = 'REJECTED';
+      verification.reason = 'ยังยืนยันชื่อหรือบัญชีผู้รับเงินจากสลิปกับข้อมูลร้านค้าไม่ได้ กรุณาให้ร้านค้าตรวจสอบสลิป';
+    }
+
     const transactionId = `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
 
     const { rows: duplicateSlips } = await connection.query(
@@ -444,7 +473,7 @@ async function handlePostPaymentSlip(req, res) {
         verification.detectedAmount,
         slipStatus,
         verification.reason,
-        String(req.body.ocrText || '').slice(0, 8000),
+        String(verification.ocrText || '').slice(0, 8000),
         transactionId,
         merchant.primaryChannel
       ]
