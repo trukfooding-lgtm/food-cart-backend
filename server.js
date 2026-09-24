@@ -61,10 +61,12 @@ app.get('/', (req, res) => {
 
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
+const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
+// Register the specific payment-slip endpoint before the legacy generic
+// orders router, whose /:id/payment-slip route would otherwise intercept it.
+app.use('/api', paymentRoutes);
 app.use('/api/orders', ordersRoutes);
 app.use('/api/internal', internalAccountStatusRoutes);
-const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
-app.use('/api', paymentRoutes);
 
 app.post('/api/otp/send', async (req, res) => {
   const recipientEmail =
