@@ -11,14 +11,10 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const crypto = require('crypto');
+const fs = require('fs/promises');
+const path = require('path');
 const { generatePromptPayPayload } = require('../services/promptPayService');
 const { sendMerchantNotification } = require('../../services/merchant_push_notification');
-const {
-  SlipStorageError,
-  uploadPaymentSlip,
-  getPaymentSlipUrl,
-  deletePaymentSlip
-} = require('../services/slipStorageService');
 
 const { createWorker } = require('tesseract.js');
 let pool = null;
@@ -57,10 +53,16 @@ const BANK_MAP = {
   'GSB': 'ธนาคารออมสิน'
 };
 
+const slipUploadDirectory = path.resolve(__dirname, '../../uploads/slips');
+
 function normalisePaymentType(value) {
   return String(value || '').trim().toUpperCase() === 'PROMPTPAY'
     ? 'PROMPTPAY'
     : 'BANK_ACCOUNT';
+}
+
+function publicSlipUrl(req, fileName) {
+  return `${req.protocol}://${req.get('host')}/uploads/slips/${fileName}`;
 }
 
 function getFileExtension(file) {
@@ -70,6 +72,42 @@ function getFileExtension(file) {
     'image/webp': 'webp'
   };
   return byMimeType[file.mimetype] || 'jpg';
+}
+
+function formatReportAmount(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? `฿${amount.toFixed(2)}` : '-';
+}
+
+function formatReportDate(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString();
+}
+
+function buildVerifiedPaymentReportDetails(orderId, slip) {
+  const paymentStatus = slip.transaction_id ||
+    ['PAID', 'ชำระเงินแล้ว', 'พร้อมรับ', 'รับอาหารสำเร็จแล้ว'].includes(slip.order_status)
+    ? 'ชำระเงินแล้ว'
+    : 'ตรวจสอบสลิปผ่านแล้ว';
+
+  return [
+    `ออเดอร์ #${orderId}`,
+    `ลูกค้า: ${slip.customer_name || '-'} (ID: ${slip.customer_id || '-'})`,
+    `รายการอาหาร: ${slip.items_summary || '-'}`,
+    `ยอดรวมออร์เดอร์: ${formatReportAmount(slip.total_price)}`,
+    `สถานะออร์เดอร์: ${slip.order_status || '-'}`,
+    `สถานะร้านค้า: ${slip.merchant_status || '-'}`,
+    `สถานะการชำระเงิน: ${paymentStatus}`,
+    `สถานะสลิป: ${slip.slip_status || '-'}`,
+    `ยอดตามออร์เดอร์: ${formatReportAmount(slip.expected_amount)}`,
+    `ยอดที่อ่านจากสลิป: ${formatReportAmount(slip.detected_amount)}`,
+    `เหตุผลตรวจสอบสลิป: ${slip.validation_reason || '-'}`,
+    `เวลาสั่งซื้อ: ${formatReportDate(slip.order_created_at)}`,
+    `เวลาชำระเงิน: ${formatReportDate(slip.paid_at)}`,
+    `เวลาส่งสลิป: ${formatReportDate(slip.slip_created_at)}`,
+    `หลักฐานสลิป: ${slip.slip_url || '-'}`,
+  ].join('\n');
 }
 
 async function performServerOcr(imageBuffer, expectedAmount) {
@@ -121,25 +159,6 @@ async function performServerOcr(imageBuffer, expectedAmount) {
     console.error('⚠️ [Server OCR Error]:', err.message);
     return null;
   }
-}
-
-function normalizeRecipientText(value) {
-  return String(value || '').toLocaleLowerCase('th-TH').replace(/[^\p{L}\p{N}]/gu, '');
-}
-
-function recipientMatchesSlip(ocrText, merchant) {
-  const normalizedText = normalizeRecipientText(ocrText);
-  const textDigits = String(ocrText || '').replace(/\D/g, '');
-  const names = [
-    merchant?.recipientName,
-    merchant?.name
-  ].map(normalizeRecipientText).filter(name => name.length >= 4);
-  const identifiers = (merchant?.recipientIdentifiers || [])
-    .map(value => String(value || '').replace(/\D/g, ''))
-    .filter(value => value.length >= 4);
-
-  if (names.some(name => normalizedText.includes(name))) return true;
-  return identifiers.some(identifier => textDigits.includes(identifier.slice(-4)));
 }
 
 function evaluateClientOcr({ expectedAmount, detectedAmount, ocrStatus, ocrText }) {
@@ -227,14 +246,12 @@ async function getMerchantPaymentConfig(merchantId) {
         const bankCode = (acc.bank_code || acc.bank || 'KBANK').toUpperCase();
         const bankName = acc.bank_name || BANK_MAP[bankCode] || 'ธนาคารกสิกรไทย';
         const accNo = acc.account_number || acc.account_no || '';
-        const accName = acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
+        const accName = acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
         const promptpay = acc.promptpay_id || acc.promptpay_number || acc.promptpay || '';
 
         return {
           id: cleanId,
           name: merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck',
-          recipientName: acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || '',
-          recipientIdentifiers: [paymentType === 'PROMPTPAY' ? promptpay : accNo],
           primaryChannel: paymentType,
           promptpay: paymentType === 'PROMPTPAY' ? promptpay : '',
           bankAccount: paymentType === 'BANK_ACCOUNT' && accNo ? {
@@ -254,8 +271,6 @@ async function getMerchantPaymentConfig(merchantId) {
   return {
     id: cleanId,
     name: 'ร้านค้า',
-    recipientName: '',
-    recipientIdentifiers: [],
     promptpay: '',
     primaryChannel: null,
     bankAccount: null
@@ -359,7 +374,7 @@ async function handleGetPaymentInfo(req, res) {
  */
 async function handlePostPaymentSlip(req, res) {
   let connection;
-  let savedSlipLocation = null;
+  let savedFilePath = null;
   try {
     const { orderId } = req.params;
     const cleanOrderId = orderId.toString().replace(/[^0-9]/g, '');
@@ -426,12 +441,6 @@ async function handlePostPaymentSlip(req, res) {
       reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาแนบสลิปจริงที่ชัดเจน'
     };
 
-    if (verification.verified && !recipientMatchesSlip(verification.ocrText, merchant)) {
-      verification.verified = false;
-      verification.ocrStatus = 'REJECTED';
-      verification.reason = 'ยังยืนยันชื่อหรือบัญชีผู้รับเงินจากสลิปกับข้อมูลร้านค้าไม่ได้ กรุณาให้ร้านค้าตรวจสอบสลิป';
-    }
-
     const transactionId = `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
 
     const { rows: duplicateSlips } = await connection.query(
@@ -447,13 +456,11 @@ async function handlePostPaymentSlip(req, res) {
       });
     }
 
+    await fs.mkdir(slipUploadDirectory, { recursive: true });
     const fileName = `order-${cleanOrderId}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${getFileExtension(req.file)}`;
-    savedSlipLocation = await uploadPaymentSlip({
-      orderId: cleanOrderId,
-      fileName,
-      buffer: req.file.buffer,
-      contentType: req.file.mimetype
-    });
+    savedFilePath = path.join(slipUploadDirectory, fileName);
+    await fs.writeFile(savedFilePath, req.file.buffer);
+    const slipUrl = publicSlipUrl(req, fileName);
     const slipStatus = verification.verified ? 'VERIFIED' : 'REJECTED';
 
     await connection.query(
@@ -467,13 +474,13 @@ async function handlePostPaymentSlip(req, res) {
       [
         cleanOrderId,
         order.customer_id,
-        savedSlipLocation,
+        slipUrl,
         verification.detectedAmount,
         expectedAmount,
         verification.detectedAmount,
         slipStatus,
         verification.reason,
-        String(verification.ocrText || '').slice(0, 8000),
+        String(req.body.ocrText || '').slice(0, 8000),
         transactionId,
         merchant.primaryChannel
       ]
@@ -536,11 +543,10 @@ async function handlePostPaymentSlip(req, res) {
 
   } catch (error) {
     if (connection) await connection.query('ROLLBACK');
-    if (savedSlipLocation) await deletePaymentSlip(savedSlipLocation).catch(() => {});
+    if (savedFilePath) await fs.unlink(savedFilePath).catch(() => {});
     console.error('❌ [Payment Verification Failed]: ' + error.message);
-    return res.status(error instanceof SlipStorageError ? 503 : 400).json({
+    return res.status(400).json({
       success: false,
-      code: error.code,
       message: error.message
     });
   } finally {
@@ -572,25 +578,55 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'ไม่พบหลักฐานการชำระเงิน' });
     }
-    const slipUrl = await getPaymentSlipUrl(rows[0].slip_url);
-    return res.json({ success: true, data: { ...rows[0], slip_url: slipUrl } });
+    return res.json({ success: true, data: rows[0] });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// ร้านรายงานสลิปย้อนหลังได้ทุกสถานะ โดยไม่ใช่การยืนยันชำระเงิน
+// ร้านรายงานปัญหาจากหน้าตรวจสอบสลิป
 router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async (req, res) => {
   try {
     const orderId = String(req.params.orderId).replace(/[^0-9]/g, '');
     const { rows } = await pool.query(
       `SELECT COALESCE(o.customer_id, mo.customer_id) AS customer_id,
-              os.validation_reason, os.status
+              COALESCE(
+                NULLIF(c.name_surname, ''),
+                NULLIF(c.username, ''),
+                NULLIF(mo.customer_name, ''),
+                'ไม่ระบุชื่อลูกค้า'
+              ) AS customer_name,
+              COALESCE(o.total_price, mo.total_price) AS total_price,
+              o.status AS order_status,
+              mo.merchant_status,
+              o.transaction_id,
+              o.paid_at,
+              o.created_at AS order_created_at,
+              os.slip_url,
+              os.expected_amount,
+              os.detected_amount,
+              os.status AS slip_status,
+              os.validation_reason,
+              os.created_at AS slip_created_at,
+              COALESCE(
+                (
+                  SELECT STRING_AGG(
+                    oi.item_name || ' x' || oi.quantity::text,
+                    ', ' ORDER BY oi.id
+                  )
+                  FROM order_items oi
+                  WHERE oi.order_id::text = os.order_id
+                ),
+                mo.items_summary,
+                '-'
+              ) AS items_summary
        FROM order_slips os
        LEFT JOIN orders o ON o.id::text = os.order_id
        LEFT JOIN merchant_orders mo
          ON mo.source_order_id::text = os.order_id
         AND mo.merchant_id = $2
+       LEFT JOIN customer c
+         ON c.customer_id = COALESCE(o.customer_id, mo.customer_id)
        WHERE os.order_id = $1
          AND COALESCE(o.merchant_id, mo.merchant_id) = $2
        ORDER BY os.created_at DESC
@@ -598,24 +634,40 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async 
       [orderId, req.params.merchantId]
     );
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: 'ไม่พบสลิปสำหรับออเดอร์นี้' });
+      return res.status(404).json({ success: false, message: 'ไม่พบสลิปผิดปกติสำหรับออเดอร์นี้' });
     }
 
-    const reason = rows[0].status === 'REJECTED'
-      ? (rows[0].validation_reason || 'ระบบตรวจพบสลิปผิดปกติ')
-      : 'ร้านรายงานว่ายังไม่พบยอดชำระเงิน กรุณาตรวจสอบรายการโอนและหลักฐานอีกครั้ง';
+    const slip = rows[0];
+    const slipStatus = String(slip.slip_status || '').toUpperCase();
+    if (slipStatus !== 'REJECTED' && slipStatus !== 'VERIFIED') {
+      return res.status(404).json({ success: false, message: 'ไม่พบสลิปที่สามารถรายงานได้' });
+    }
+
+    if (slipStatus === 'REJECTED') {
+      const reason = slip.validation_reason || 'ระบบตรวจพบสลิปผิดปกติ';
+      await pool.query(
+        `INSERT INTO merchant_issue_reports
+          (merchant_id, issue_type, order_reference, details, status)
+         VALUES ($1, 'SLIP_MISMATCH', $2, $3, 'รอตรวจสอบ')`,
+        [req.params.merchantId, `ORD-${orderId}`, reason]
+      );
+      await pool.query(
+        `INSERT INTO notifications (user_id, title, body)
+         VALUES ($1, 'สลิปการชำระเงินมีปัญหา', $2)`,
+        [slip.customer_id, `ออเดอร์ #${orderId}: ${reason} กรุณาแนบสลิปใหม่`]
+      );
+      return res.json({ success: true, message: 'รายงานสลิปผิดปกติและแจ้งลูกค้าแล้ว' });
+    }
+
+    const orderDetails = buildVerifiedPaymentReportDetails(orderId, slip);
+
     await pool.query(
       `INSERT INTO merchant_issue_reports
         (merchant_id, issue_type, order_reference, details, status)
-       VALUES ($1, 'SLIP_MISMATCH', $2, $3, 'รอตรวจสอบ')`,
-      [req.params.merchantId, `ORD-${orderId}`, reason]
+       VALUES ($1, 'PAYMENT_NOT_RECEIVED', $2, $3, 'รอตรวจสอบ')`,
+      [req.params.merchantId, `ORD-${orderId}`, orderDetails]
     );
-    await pool.query(
-      `INSERT INTO notifications (user_id, title, body)
-       VALUES ($1, 'สลิปการชำระเงินมีปัญหา', $2)`,
-      [rows[0].customer_id, `ออเดอร์ #${orderId}: ${reason} กรุณาแนบสลิปใหม่`]
-    );
-    return res.json({ success: true, message: 'รายงานสลิปผิดปกติและแจ้งลูกค้าแล้ว' });
+    return res.json({ success: true, message: 'ส่งรายงานออร์เดอร์และข้อมูลการชำระเงินให้แอดมินแล้ว' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -629,3 +681,4 @@ router.post('/orders/:orderId/payment-slip', upload.single('slip'), handlePostPa
 router.post('/:orderId/payment-slip', upload.single('slip'), handlePostPaymentSlip);
 
 module.exports = router;
+module.exports.buildVerifiedPaymentReportDetails = buildVerifiedPaymentReportDetails;
