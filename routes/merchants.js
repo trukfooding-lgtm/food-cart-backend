@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
+const {
+  sendCustomerPushNotifications
+} = require('../services/customer_push_notification');
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
 const { getActiveSuspension } = require('../services/account_status');
 const { normalizeMenuImageFields, normalizeUploadImageUrl } = require('../services/menuImageUrlService');
@@ -2036,7 +2039,16 @@ router.put(
       }
 
       await connection.query('COMMIT');
-
+      if (
+        status === 'รอรับสินค้า' &&
+        customerOrder.merchant_status !== 'รอรับสินค้า'
+    ) {
+  await sendCustomerPushNotifications(
+    customerOrder.customer_id,
+    'ออเดอร์พร้อมรับแล้ว',
+    `ออเดอร์ #${req.params.orderId} ทางร้านอัปเดตเป็นพร้อมรับ สามารถไปรับอาหารได้เลย`
+  );
+}
       res.json({
         success: true,
         merchant_status: status,

@@ -1,4 +1,7 @@
 const { pool } = require('../config/db');
+const {
+  sendCustomerPushNotifications
+} = require('./customer_push_notification');
 async function notifyFollowersOfStoreStatus(
   client,
   {
@@ -13,15 +16,19 @@ async function notifyFollowersOfStoreStatus(
   if (scheduled || previousStatus === currentStatus) return;
   if (currentStatus !== 'เปิดร้าน' && currentStatus !== 'กำลังย้าย') return;
   const isMoving = currentStatus === 'กำลังย้าย';
-  const title = isMoving ? 'ร้านที่คุณติดตามกำลังย้าย' : 'ร้านที่คุณติดตามเปิดขายแล้ว';
+  const title = isMoving
+    ? 'ร้านที่คุณติดตามกำลังย้าย'
+    : 'ร้านที่คุณติดตามเปิดขายแล้ว';
   const body = isMoving
     ? `ร้าน ${merchantName || ''} กำลังย้ายจุดขาย`
     : `ร้าน ${merchantName || ''} เปิดขายแล้วนะ 📍 อยู่ที่ ${locationName || 'จุดขาย'}`;
-  await client.query(
+  const { rows } = await client.query(
     `INSERT INTO notifications (user_id,title,body)
-     SELECT DISTINCT customer_id, $2, $3 FROM followed WHERE merchant_id = $1`,
+     SELECT DISTINCT customer_id, $2, $3 FROM followed WHERE merchant_id = $1
+     RETURNING user_id`,
     [merchantId, title, body]
   );
+  return { customerIds: rows.map(row => row.user_id), title, body };
 }
 
 async function expireStores() {
@@ -107,7 +114,7 @@ function installMerchantMap(router) {
           status==='เปิดร้าน'&&hasPoint?longitude:previous?.longitude??null,
           status==='เปิดร้าน'&&hasPoint?String(location_name||'จุดขาย'):previous?.location_name??null,
           starts??null,status==='ปิดร้าน'?null:ends]);
-      await notifyFollowersOfStoreStatus(client, {
+      const pushNotification = await notifyFollowersOfStoreStatus(client, {
         merchantId: req.params.id,
         merchantName: merchant.rows[0]?.name,
         previousStatus: previous?.status,
@@ -116,6 +123,13 @@ function installMerchantMap(router) {
         locationName: location_name || previous?.location_name
       });
       await client.query('COMMIT');
+      if (pushNotification) {
+        await sendCustomerPushNotifications(
+          pushNotification.customerIds,
+          pushNotification.title,
+          pushNotification.body
+        );
+      }
       res.json({success:true,status:effectiveStatus,scheduled_open:scheduled,message:'บันทึกรอบขายสำเร็จ'});
     } catch(e) { await client.query('ROLLBACK'); res.status(500).json({success:false,message:'บันทึกจุดขายไม่สำเร็จ'}); }
     finally { client.release(); }
