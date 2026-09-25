@@ -1219,6 +1219,25 @@ async function insertSlipRecord({
  }
 }
 
+// ทำให้ออร์เดอร์ฝั่งร้านเข้าสู่รายการตรวจสอบเมื่อมีสลิปส่งเข้ามาแล้ว
+// โดยไม่เปลี่ยนสถานะหรือข้อมูลออร์เดอร์ฝั่งลูกค้า
+async function markMerchantOrderForSlipReview({ orderId, merchantId }) {
+ if (merchantId == null) return;
+
+ try {
+   await pool.query(
+     `UPDATE merchant_orders
+      SET merchant_status = 'รอตรวจสอบ', updated_at = NOW()
+      WHERE source_order_id = $1
+        AND merchant_id = $2
+        AND merchant_status IN ('ใหม่', 'รอชำระเงิน')`,
+     [orderId, merchantId],
+   );
+ } catch (error) {
+   console.warn('Merchant slip review status warning:', error.message);
+ }
+}
+
 // เก็บสลิปที่ตรวจไม่ผ่านไว้ให้ร้านค้าเปิดตรวจสอบและรายงานได้
 // โดยคงพฤติกรรมแจ้งเตือนร้านเดิมไว้
 async function recordRejectedSlip({
@@ -1242,6 +1261,8 @@ async function recordRejectedSlip({
    ocrText,
    transactionId: `REJECTED_${orderId}_${Date.now()}`,
  });
+
+ await markMerchantOrderForSlipReview({ orderId, merchantId });
 
  try {
    await sendMerchantNotification({
@@ -1421,6 +1442,7 @@ router.post(
         !normTxId
       ) {
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
+        await markMerchantOrderForSlipReview({ orderId, merchantId: mId });
 
         // กรณีที่ยังไม่ผ่านการตรวจสอบอัตโนมัติ ต้องเก็บสลิปไว้ให้ร้านค้า
         // เปิดดูและตัดสินใจได้ โดยไม่เรียกแจ้งเตือนซ้ำกับกรณี UNREADABLE
