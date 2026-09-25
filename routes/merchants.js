@@ -1714,6 +1714,7 @@ router.get('/:id/orders', async (req, res) => {
              THEN COALESCE(o.paid_at, mo.updated_at)
              ELSE NULL
            END AS paid_at,
+           latest_slip.status AS latest_slip_status,
            CASE
              WHEN o.status = 'รอชำระเงิน'
              THEN o.payment_deadline
@@ -1733,6 +1734,14 @@ router.get('/:id/orders', async (req, res) => {
          LEFT JOIN customer_merchant_points cmp
            ON cmp.customer_id = o.customer_id
           AND cmp.merchant_id = o.merchant_id
+
+         LEFT JOIN LATERAL (
+           SELECT os.status
+           FROM order_slips os
+           WHERE os.order_id::text = o.id::text
+           ORDER BY os.created_at DESC, os.id DESC
+           LIMIT 1
+         ) latest_slip ON TRUE
 
          WHERE o.merchant_id = $1
 
