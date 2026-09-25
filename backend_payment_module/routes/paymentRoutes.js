@@ -65,6 +65,15 @@ function publicSlipUrl(req, fileName) {
   return `${req.protocol}://${req.get('host')}/uploads/slips/${fileName}`;
 }
 
+async function notifyCustomer(customerId, title, body, db = pool) {
+  if (customerId == null) return;
+  await db.query(
+    `INSERT INTO notifications (user_id, title, body)
+     VALUES ($1, $2, $3)`,
+    [customerId, title, body],
+  );
+}
+
 function getFileExtension(file) {
   const byMimeType = {
     'image/jpeg': 'jpg',
@@ -578,6 +587,12 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     const { rows } = await pool.query(
       `SELECT os.order_id, os.slip_url, os.expected_amount, os.detected_amount,
               os.status, os.validation_reason, os.created_at,
+              (
+                SELECT COUNT(*)::int
+                FROM order_slips rejected_slips
+                WHERE rejected_slips.order_id = os.order_id
+                  AND rejected_slips.status = 'REJECTED'
+              ) AS rejected_slip_count,
               COALESCE(o.customer_id, mo.customer_id) AS customer_id,
               c.name_surname AS customer_name
        FROM order_slips os
@@ -599,6 +614,183 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     return res.json({ success: true, data: rows[0] });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ร้านค้ายกเลิกออเดอร์และรายงานลูกค้าเมื่อส่งสลิปผิดปกติซ้ำ
+router.post('/merchants/:merchantId/orders/:orderId/payment-slip/cancel-and-report', async (req, res) => {
+  let connection;
+  try {
+    const merchantId = req.params.merchantId;
+    const orderId = String(req.params.orderId).replace(/[^0-9]/g, '');
+    const orderReference = `ORD-${orderId}`;
+
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+
+    const { rows } = await connection.query(
+      `SELECT COALESCE(o.customer_id, mo.customer_id) AS customer_id,
+              COALESCE(
+                NULLIF(c.name_surname, ''),
+                NULLIF(c.username, ''),
+                NULLIF(mo.customer_name, ''),
+                'ไม่ระบุชื่อลูกค้า'
+              ) AS customer_name,
+              COALESCE(o.total_price, mo.total_price) AS total_price,
+              o.status AS order_status,
+              mo.merchant_status,
+              COALESCE(
+                NULLIF(mo.items_summary, ''),
+                (
+                  SELECT STRING_AGG(
+                    oi.item_name || ' x' || oi.quantity::text,
+                    ', ' ORDER BY oi.id
+                  )
+                  FROM order_items oi
+                  WHERE oi.order_id = o.id
+                ),
+                '-'
+              ) AS items_summary,
+              os.slip_url,
+              os.validation_reason,
+              os.created_at AS slip_created_at,
+              os.status AS slip_status,
+              (
+                SELECT COUNT(*)::int
+                FROM order_slips rejected_slips
+                WHERE rejected_slips.order_id = os.order_id
+                  AND rejected_slips.status = 'REJECTED'
+              ) AS rejected_slip_count
+       FROM order_slips os
+       LEFT JOIN orders o ON o.id::text = os.order_id
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id::text = os.order_id
+        AND mo.merchant_id = $2
+       LEFT JOIN customer c
+         ON c.customer_id = COALESCE(o.customer_id, mo.customer_id)
+       WHERE os.order_id = $1
+         AND COALESCE(o.merchant_id, mo.merchant_id) = $2
+       ORDER BY os.created_at DESC
+       LIMIT 1`,
+      [orderId, merchantId],
+    );
+
+    if (rows.length === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบสลิปของออเดอร์นี้',
+      });
+    }
+
+    const slip = rows[0];
+    if (String(slip.slip_status || '').toUpperCase() !== 'REJECTED') {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'ออเดอร์นี้ไม่มีสลิปผิดปกติล่าสุดให้ยกเลิก',
+      });
+    }
+
+    if (Number(slip.rejected_slip_count || 0) < 2) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'ต้องพบสลิปผิดปกติซ้ำอย่างน้อย 2 ครั้งก่อนยกเลิกออเดอร์',
+      });
+    }
+
+    const { rows: existingReports } = await connection.query(
+      `SELECT id
+       FROM merchant_issue_reports
+       WHERE merchant_id = $1
+         AND order_reference = $2
+         AND issue_type = 'REPEATED_INVALID_SLIP'
+       LIMIT 1`,
+      [merchantId, orderReference],
+    );
+    if (existingReports.length > 0) {
+      await connection.query('ROLLBACK');
+      return res.json({
+        success: true,
+        alreadyHandled: true,
+        message: 'ออเดอร์นี้ถูกยกเลิกและรายงานลูกค้าแล้ว',
+      });
+    }
+
+    const details = [
+      `ออเดอร์ #${orderId}`,
+      `ลูกค้า: ${slip.customer_name || '-'}`,
+      `รายการอาหาร: ${slip.items_summary || '-'}`,
+      `ยอดรวมออร์เดอร์: ${formatReportAmount(slip.total_price)}`,
+      `สถานะออร์เดอร์เดิม: ${slip.order_status || '-'}`,
+      `สถานะร้านค้าเดิม: ${slip.merchant_status || '-'}`,
+      `จำนวนสลิปผิดปกติ: ${slip.rejected_slip_count} ครั้ง`,
+      `เหตุผลล่าสุด: ${slip.validation_reason || 'ตรวจพบสลิปผิดปกติซ้ำ'}`,
+      `เวลาส่งสลิปล่าสุด: ${formatReportDate(slip.slip_created_at)}`,
+      `หลักฐานสลิปล่าสุด: ${slip.slip_url || '-'}`,
+    ].join('\n');
+
+    const orderUpdate = await connection.query(
+      `UPDATE orders
+       SET status = 'ยกเลิก', updated_at = NOW()
+       WHERE id = $1
+         AND merchant_id = $2`,
+      [orderId, merchantId],
+    );
+    if (orderUpdate.rowCount === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์ฝั่งลูกค้า',
+      });
+    }
+
+    const merchantOrderUpdate = await connection.query(
+      `UPDATE merchant_orders
+       SET merchant_status = 'ยกเลิก',
+           reject_reason = 'ลูกค้าแนบสลิปผิดปกติซ้ำ',
+           rejected_at = NOW(),
+           updated_at = NOW()
+       WHERE merchant_id = $1
+         AND source_order_id = $2`,
+      [merchantId, orderId],
+    );
+    if (merchantOrderUpdate.rowCount === 0) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์ฝั่งร้านค้า',
+      });
+    }
+
+    await connection.query(
+      `INSERT INTO merchant_issue_reports
+        (merchant_id, issue_type, order_reference, details, image_url, status)
+       VALUES ($1, 'REPEATED_INVALID_SLIP', $2, $3, $4, 'รอตรวจสอบ')`,
+      [merchantId, orderReference, details, slip.slip_url || null],
+    );
+
+    await notifyCustomer(
+      slip.customer_id,
+      'ออเดอร์ถูกยกเลิก',
+      `ออเดอร์ #${orderId} ถูกยกเลิกเนื่องจากแนบสลิปผิดปกติซ้ำ และส่งรายงานให้แอดมินตรวจสอบแล้ว`,
+      connection,
+    );
+
+    await connection.query('COMMIT');
+    return res.json({
+      success: true,
+      message: 'ยกเลิกออเดอร์และส่งรายงานลูกค้าให้แอดมินแล้ว',
+    });
+  } catch (error) {
+    if (connection) await connection.query('ROLLBACK');
+    return res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถยกเลิกออเดอร์และรายงานลูกค้าได้',
+    });
+  } finally {
+    connection?.release();
   }
 });
 
