@@ -705,7 +705,7 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/cancel-and-repo
        FROM merchant_issue_reports
        WHERE merchant_id = $1
          AND order_reference = $2
-         AND issue_type = 'REPEATED_INVALID_SLIP'
+         AND issue_type = 'ปัญหาเกี่ยวกับออเดอร์'
        LIMIT 1`,
       [merchantId, orderReference],
     );
@@ -767,7 +767,7 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/cancel-and-repo
     await connection.query(
       `INSERT INTO merchant_issue_reports
         (merchant_id, issue_type, order_reference, details, image_url, status)
-       VALUES ($1, 'REPEATED_INVALID_SLIP', $2, $3, $4, 'รอตรวจสอบ')`,
+       VALUES ($1, 'ปัญหาเกี่ยวกับออเดอร์', $2, $3, $4, 'รอตรวจสอบ')`,
       [merchantId, orderReference, details, slip.slip_url || null],
     );
 
