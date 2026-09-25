@@ -110,11 +110,26 @@ function buildVerifiedPaymentReportDetails(orderId, slip) {
   ].join('\n');
 }
 
+const SERVER_OCR_TIMEOUT_MS = 20_000;
+
 async function performServerOcr(imageBuffer, expectedAmount) {
+  let worker = null;
+  let timedOut = false;
+  let timeoutId;
   try {
-    const worker = await createWorker('tha+eng');
-    const { data: { text } } = await worker.recognize(imageBuffer);
-    await worker.terminate();
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`Server OCR timeout after ${SERVER_OCR_TIMEOUT_MS}ms`));
+      }, SERVER_OCR_TIMEOUT_MS);
+    });
+    const task = (async () => {
+      worker = await createWorker('tha+eng');
+      if (timedOut) throw new Error('Server OCR timed out before worker initialization completed');
+      const { data: { text } } = await worker.recognize(imageBuffer);
+      return text;
+    })();
+    const text = await Promise.race([task, timeout]);
 
     const normalized = String(text || '').replace(/[๐-๙]/g, d => '0123456789'['๐๑๒๓๔๕๖๗๘๙'.indexOf(d)]).replaceAll('\u00a0', ' ');
     const amountPattern = /(?<!\d)(\d{1,3}(?:[,\s]\d{3})*|\d+)(?:[.,](\d{1,2}))?(?!\d)/g;
@@ -158,6 +173,9 @@ async function performServerOcr(imageBuffer, expectedAmount) {
   } catch (err) {
     console.error('⚠️ [Server OCR Error]:', err.message);
     return null;
+  } finally {
+    clearTimeout(timeoutId);
+    if (worker) await worker.terminate().catch(() => {});
   }
 }
 
