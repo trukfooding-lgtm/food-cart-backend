@@ -62,10 +62,11 @@ app.get('/', (req, res) => {
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
 const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
-// Register the specific payment-slip endpoint before the legacy generic
-// orders router, whose /:id/payment-slip route would otherwise intercept it.
-app.use('/api', paymentRoutes);
 app.use('/api/orders', ordersRoutes);
+// The Flutter app uploads customer slips to /api/orders/:id/payment-slip.
+// Keep this route before the payment module's generic /:orderId/payment-slip
+// fallback so rejected slips are persisted and sent to the merchant review flow.
+app.use('/api', paymentRoutes);
 app.use('/api/internal', internalAccountStatusRoutes);
 
 app.post('/api/otp/send', async (req, res) => {
