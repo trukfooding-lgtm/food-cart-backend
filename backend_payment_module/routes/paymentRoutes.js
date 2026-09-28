@@ -4,7 +4,7 @@
  * รองรับ:
  * - ดึงข้อมูลช่องทางชำระเงินของร้านค้าจาก Supabase จริง (ตาราง merchant_bank_accounts / merchants)
  * - อัปเดตสถานะคำสั่งซื้อใน Supabase เป็น 'PAID' ทันทีเมื่อตรวจสลิปผ่าน
- * - ตรวจสอบสลิปในเครื่อง 100% ป้องกันสลิปซ้ำผ่าน Transaction ID
+ * - ตรวจสลิปอัตโนมัติด้วย SlipOK และส่งกรณีไม่ชัดเจนให้ร้านตรวจสอบ
  */
 
 const express = require('express');
@@ -22,7 +22,6 @@ const {
 } = require('../services/slipStorageService');
 const { getSlipOkConfigState, verifySlipWithSlipOk } = require('../services/slipOkService');
 
-const { createWorker } = require('tesseract.js');
 let pool = null;
 try {
   const dbConfig = require('../../config/db');
@@ -87,13 +86,6 @@ function getFileExtension(file) {
   return byMimeType[file.mimetype] || 'jpg';
 }
 
-function addDetectedSlipAmount(amounts, rawAmount) {
-  const detectedAmount = Number(rawAmount.replace(/,/g, ''));
-  if (detectedAmount > 0 && detectedAmount <= 1000000 && !amounts.includes(detectedAmount)) {
-    amounts.push(detectedAmount);
-  }
-}
-
 function formatReportAmount(value) {
   const amount = Number(value);
   return Number.isFinite(amount) ? `฿${amount.toFixed(2)}` : '-';
@@ -128,159 +120,6 @@ function buildVerifiedPaymentReportDetails(orderId, slip) {
     `เวลาส่งสลิป: ${formatReportDate(slip.slip_created_at)}`,
     `หลักฐานสลิป: ${slip.slip_url || '-'}`,
   ].join('\n');
-}
-
-const SERVER_OCR_TIMEOUT_MS = 20_000;
-
-function extractLabeledSlipAmounts(lines) {
-  const label = /ยอด(?:โอน|ชำระ|เงิน)|จำนวนเงิน|amount|transfer(?:red)?|total/i;
-  const amount = /(?:ยอด(?:โอน|ชำระ|เงิน)|จำนวนเงิน|amount|transfer(?:red)?|total)\s*[:：]?\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)/gi;
-  const amounts = [];
-
-  for (let index = 0; index < lines.length; index++) {
-    if (!label.test(lines[index])) continue;
-    const context = [lines[index], lines[index + 1]].filter(Boolean).join(' ');
-    amount.lastIndex = 0;
-    for (const match of context.matchAll(amount)) addDetectedSlipAmount(amounts, match[1]);
-  }
-  return amounts;
-}
-
-function extractCurrencySlipAmounts(lines) {
-  const currencyAmount = /฿\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)|([0-9][0-9,]*(?:[.,][0-9]{1,2})?)\s*(?:บาท|\bTHB\b)/gi;
-  const otherNumberField = /ค่าธรรมเนียม|\bfee\b|บัญชี|account|วันที่|เวลา|\bdate\b|\btime\b|ref(?:erence)?|transaction|รหัส|เบอร์|phone/i;
-  const amounts = [];
-
-  for (const line of lines) {
-    if (otherNumberField.test(line)) continue;
-    currencyAmount.lastIndex = 0;
-    for (const match of line.matchAll(currencyAmount)) {
-      addDetectedSlipAmount(amounts, match[1] || match[2]);
-    }
-  }
-  return amounts;
-}
-
-function extractSlipAmounts(ocrText) {
-  const lines = ocrText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  const labeledAmounts = extractLabeledSlipAmounts(lines);
-  return labeledAmounts.length > 0 ? labeledAmounts : extractCurrencySlipAmounts(lines);
-}
-
-async function performServerOcr(imageBuffer, expectedAmount) {
-  let worker = null;
-  let timedOut = false;
-  let timeoutId;
-  try {
-    const timeout = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        reject(new Error(`Server OCR timeout after ${SERVER_OCR_TIMEOUT_MS}ms`));
-      }, SERVER_OCR_TIMEOUT_MS);
-    });
-    const task = (async () => {
-      worker = await createWorker('tha+eng');
-      if (timedOut) throw new Error('Server OCR timed out before worker initialization completed');
-      return worker.recognize(imageBuffer);
-    })();
-    const { data } = await Promise.race([task, timeout]);
-    const normalized = String(data.text || '')
-      .replace(/[๐-๙]/g, digit => '0123456789'['๐๑๒๓๔๕๖๗๘๙'.indexOf(digit)])
-      .replaceAll('\u00a0', ' ')
-      .trim();
-    const exp = Number(expectedAmount);
-    const confidence = Number(data.confidence) || 0;
-    const candidates = extractSlipAmounts(normalized);
-    const matching = candidates.find(amount => Math.abs(amount - exp) < 0.01);
-
-    if (matching && confidence >= 70) {
-      return {
-        verified: true,
-        detectedAmount: matching,
-        ocrStatus: 'VERIFIED',
-        ocrText: normalized,
-        reason: `ระบบเซิร์ฟเวอร์อ่านยอดจากสลิปตรงกับยอดออเดอร์ (฿${matching.toFixed(2)})`
-      };
-    }
-
-    const closest = candidates.length > 0
-      ? candidates.reduce((prev, curr) => Math.abs(curr - exp) < Math.abs(prev - exp) ? curr : prev)
-      : null;
-    const needsReview = confidence < 70;
-
-    return {
-      verified: false,
-      detectedAmount: closest,
-      ocrStatus: candidates.length > 0 && !needsReview ? 'REJECTED' : 'UNREADABLE',
-      ocrText: normalized,
-      reason: needsReview
-        ? 'ผลอ่านสลิปยังไม่มั่นใจ กรุณาให้ร้านค้าตรวจสอบหลักฐาน'
-        : candidates.length > 0
-        ? `ยอดจากสลิป ฿${closest.toFixed(2)} ไม่ตรงกับยอดที่ต้องชำระ ฿${exp.toFixed(2)}`
-        : 'ระบบอ่านยอดชำระบนสลิปไม่ชัด กรุณาให้ร้านค้าตรวจสอบหลักฐาน'
-    };
-  } catch (err) {
-    console.error('⚠️ [Server OCR Error]:', err.message);
-    return null;
-  } finally {
-    clearTimeout(timeoutId);
-    if (worker) {
-      try {
-        await worker.terminate();
-      } catch (err) {
-        console.warn('⚠️ [Server OCR Cleanup]:', err.message);
-      }
-    }
-  }
-}
-
-function normalizeRecipientText(value) {
-  return String(value || '').toLocaleLowerCase('th-TH').replace(/[^\p{L}\p{N}]/gu, '');
-}
-
-function recipientMatchesSlip(ocrText, merchant) {
-  const normalizedText = normalizeRecipientText(ocrText);
-  const textDigits = String(ocrText || '').replace(/\D/g, '');
-  const names = [
-    merchant?.recipientName,
-    merchant?.name
-  ].map(normalizeRecipientText).filter(name => name.length >= 4);
-  const identifiers = (merchant?.recipientIdentifiers || [])
-    .map(value => String(value || '').replace(/\D/g, ''))
-    .filter(value => value.length >= 4);
-
-  if (names.some(name => normalizedText.includes(name))) return true;
-  return identifiers.some(identifier => textDigits.includes(identifier.slice(-4)));
-}
-
-function evaluateClientOcr({ expectedAmount, detectedAmount, ocrStatus, ocrText }) {
-  const detected = Number(detectedAmount);
-  const isAmountMatch = Number.isFinite(detected) &&
-    Math.abs(detected - Number(expectedAmount)) < 0.01;
-  const hasReadableText = String(ocrText || '').trim().length >= 3;
-
-  if (String(ocrStatus || '').toUpperCase() === 'VERIFIED' &&
-      isAmountMatch && hasReadableText) {
-    return {
-      verified: true,
-      detectedAmount: detected,
-      reason: 'ระบบอ่านยอดจากสลิปตรงกับยอดออเดอร์'
-    };
-  }
-
-  if (!hasReadableText || String(ocrStatus || '').toUpperCase() === 'UNREADABLE') {
-    return {
-      verified: false,
-      detectedAmount: Number.isFinite(detected) ? detected : null,
-      reason: 'ระบบอ่านยอดเงินจากสลิปไม่ได้ กรุณาแนบสลิปที่ชัดเจน'
-    };
-  }
-
-  return {
-    verified: false,
-    detectedAmount: Number.isFinite(detected) ? detected : null,
-    reason: `ยอดจากสลิป ${Number.isFinite(detected) ? `฿${detected.toFixed(2)}` : 'ไม่ถูกต้อง'} ไม่ตรงกับยอดที่ต้องชำระ ฿${Number(expectedAmount).toFixed(2)}`
-  };
 }
 
 /**
@@ -477,7 +316,7 @@ async function handleGetPaymentInfo(req, res) {
  */
 async function handlePostPaymentSlip(req, res) {
   let connection;
-  let savedFilePath = null;
+  let savedSlipLocation = null;
   try {
     const { orderId } = req.params;
     const cleanOrderId = orderId.toString().replace(/[^0-9]/g, '');
@@ -533,8 +372,7 @@ async function handlePostPaymentSlip(req, res) {
     }
 
     const merchant = await getMerchantPaymentConfig(order.merchant_id);
-    // ถ้าตั้งค่า SlipOK แล้ว ให้ตรวจ QR/ยอด/บัญชีผู้รับจากผู้ให้บริการก่อน
-    // กรณียังไม่ตั้งค่า จะคง OCR เดิมไว้เพื่อไม่ให้ระบบเดิมหยุดทำงาน
+    // SlipOK เป็นผู้ตัดสินอัตโนมัติเพียงรายเดียว; เมื่อไม่พร้อมจะส่งให้ร้านตรวจแทน
     const slipOkConfig = getSlipOkConfigState();
     let verification;
     if (slipOkConfig === 'configured') {
@@ -556,23 +394,15 @@ async function handlePostPaymentSlip(req, res) {
         reason: 'ตั้งค่า SlipOK ไม่ครบ กรุณาให้ร้านตรวจสอบหลักฐาน'
       };
     } else {
-      console.log('🔍 [Server OCR] SlipOK is not configured; using the existing OCR flow.');
-      verification = await performServerOcr(req.file.buffer, expectedAmount) || {
+      verification = {
         verified: false,
         manualReview: true,
         detectedAmount: null,
         transactionId: null,
         ocrStatus: 'MANUAL_REVIEW',
         ocrText: '',
-        reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาให้ร้านตรวจสอบหลักฐาน'
+        reason: 'ยังไม่ได้ตั้งค่า SlipOK กรุณาให้ร้านตรวจสอบหลักฐาน'
       };
-
-      if (verification.verified && !recipientMatchesSlip(verification.ocrText, merchant)) {
-        verification.verified = false;
-        verification.manualReview = true;
-        verification.ocrStatus = 'MANUAL_REVIEW';
-        verification.reason = 'ยังยืนยันชื่อหรือบัญชีผู้รับเงินจากสลิปกับข้อมูลร้านค้าไม่ได้ กรุณาให้ร้านตรวจสอบสลิป';
-      }
     }
 
     const transactionId = verification.transactionId ||
@@ -626,12 +456,6 @@ async function handlePostPaymentSlip(req, res) {
     );
 
     if (verification.manualReview) {
-      await connection.query(
-        `UPDATE orders
-         SET status = 'รอตรวจสอบการชำระเงิน', updated_at = NOW()
-         WHERE id = $1`,
-        [cleanOrderId]
-      );
       await connection.query('COMMIT');
       await sendMerchantNotification({
         merchantId: order.merchant_id,
@@ -706,12 +530,95 @@ async function handlePostPaymentSlip(req, res) {
 
   } catch (error) {
     if (connection) await connection.query('ROLLBACK');
-    if (savedFilePath) await fs.unlink(savedFilePath).catch(() => {});
+    if (savedSlipLocation) {
+      await deletePaymentSlip(savedSlipLocation).catch(cleanupError => {
+        console.warn('Payment slip cleanup failed:', cleanupError.message);
+      });
+    }
     console.error('❌ [Payment Verification Failed]: ' + error.message);
     return res.status(400).json({
       success: false,
       message: error.message
     });
+  } finally {
+    connection?.release();
+  }
+}
+
+async function notifyMerchantSlipReview(merchantId, orderId, slipId) {
+  await sendMerchantNotification({
+    merchantId,
+    sourceType: 'payment_issue',
+    sourceId: `${orderId}:slip:${slipId}:review`,
+    title: 'ลูกค้าขอให้ตรวจสอบสลิป',
+    message: `ออเดอร์ #${orderId}: ลูกค้าขอให้ร้านตรวจสอบหลักฐานการชำระเงิน`,
+    data: { order_id: orderId, payment_status: 'MANUAL_REVIEW' }
+  });
+}
+
+async function requestCustomerSlipReview(req, res) {
+  let connection;
+  const orderId = String(req.params.orderId || '').replace(/[^0-9]/g, '');
+  const customerId = req.body?.customerId;
+  if (!orderId || customerId == null) {
+    return res.status(400).json({ success: false, message: 'ข้อมูลคำสั่งซื้อหรือผู้ใช้ไม่ครบ' });
+  }
+
+  try {
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+    const { rows: orders } = await connection.query(
+      `SELECT id, customer_id, merchant_id
+       FROM orders
+       WHERE id = $1
+       FOR UPDATE`,
+      [orderId]
+    );
+    if (!orders.length || String(orders[0].customer_id) !== String(customerId)) {
+      await connection.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'ไม่พบคำสั่งซื้อของบัญชีนี้' });
+    }
+
+    const { rows: slips } = await connection.query(
+      `SELECT id, status
+       FROM order_slips
+       WHERE order_id = $1 AND uploader_type = 'CUSTOMER'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [orderId]
+    );
+    if (!slips.length) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'ยังไม่มีสลิปให้ร้านตรวจสอบ' });
+    }
+
+    const slip = slips[0];
+    if (!['REJECTED', 'UNREADABLE', 'MANUAL_REVIEW'].includes(String(slip.status).toUpperCase())) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'สถานะสลิปนี้ไม่สามารถขอตรวจซ้ำได้' });
+    }
+    await connection.query(
+      `UPDATE order_slips
+       SET status = 'MANUAL_REVIEW'
+       WHERE id = $1`,
+      [slip.id]
+    );
+    await connection.query('COMMIT');
+
+    await notifyMerchantSlipReview(orders[0].merchant_id, orderId, slip.id);
+    return res.json({
+      success: true,
+      status: 'MANUAL_REVIEW',
+      message: 'ส่งคำขอให้ร้านตรวจสอบสลิปแล้ว'
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.query('ROLLBACK').catch(rollbackError => {
+        console.error('Payment review rollback failed:', rollbackError.message);
+      });
+    }
+    return res.status(500).json({ success: false, message: error.message });
   } finally {
     connection?.release();
   }
@@ -1023,6 +930,8 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async 
 router.get('/orders/:orderId/payment-info', handleGetPaymentInfo);
 router.get('/:orderId/payment-info', handleGetPaymentInfo);
 
+router.post('/orders/:orderId/payment-slip/request-review', requestCustomerSlipReview);
+router.post('/:orderId/payment-slip/request-review', requestCustomerSlipReview);
 router.post('/orders/:orderId/payment-slip', upload.single('slip'), handlePostPaymentSlip);
 router.post('/:orderId/payment-slip', upload.single('slip'), handlePostPaymentSlip);
 

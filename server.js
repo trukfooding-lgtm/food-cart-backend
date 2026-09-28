@@ -7,6 +7,7 @@ const customerRoutes = require('./routes/customers');
 const merchantRoutes = require('./routes/merchants');
 const ordersRoutes = require('./routes/orders');
 const internalAccountStatusRoutes = require('./routes/internal_account_status');
+const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,12 +62,9 @@ app.get('/', (req, res) => {
 
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
-const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
-app.use('/api/orders', ordersRoutes);
 // The Flutter app uploads customer slips to /api/orders/:id/payment-slip.
-// Keep this route before the payment module's generic /:orderId/payment-slip
-// fallback so rejected slips are persisted and sent to the merchant review flow.
 app.use('/api', paymentRoutes);
+app.use('/api/orders', ordersRoutes);
 app.use('/api/internal', internalAccountStatusRoutes);
 app.post('/api/otp/send', async (req, res) => {
   const recipientEmail =
