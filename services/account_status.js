@@ -31,9 +31,9 @@ function normalizeAccount(account) {
   const role = String(account?.role || '').trim();
   const expectedPrefix = role === 'Shop' ? 'merchant:' : role === 'Customer' ? 'customer:' : '';
   const [prefix, rawId] = userId.split(':');
-  const accountType = prefix || (role === 'Shop' ? 'merchant' : role === 'Customer' ? 'customer' : '');
+  const accountType = role === 'Shop' ? 'merchant' : role === 'Customer' ? 'customer' : '';
   const accountId = Number(account?.account_id ?? rawId);
-  if (!expectedPrefix || prefix !== expectedPrefix || !ACCOUNT_TYPES.has(accountType) || !Number.isInteger(accountId) || accountId <= 0) {
+  if (!expectedPrefix || !ACCOUNT_TYPES.has(accountType) || !Number.isInteger(accountId) || accountId <= 0) {
     throw new Error('ข้อมูลบัญชีไม่ถูกต้อง');
   }
   return {accountType, accountId};

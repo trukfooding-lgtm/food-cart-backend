@@ -201,6 +201,37 @@ router.post('/login', async (req, res) => {
 });
 
 // ==========================================================
+// ตรวจสอบสถานะบัญชีลูกค้าระหว่างเปิดแอป
+// ==========================================================
+router.get('/:id/account-status', async (req, res) => {
+  try {
+    const customerId = Number(req.params.id);
+    if (!Number.isInteger(customerId) || customerId <= 0) {
+      return res.status(400).json({success: false, message: 'รหัสลูกค้าไม่ถูกต้อง'});
+    }
+
+    const {rows: customers} = await pool.query(
+      'SELECT customer_id FROM customer WHERE customer_id = $1 LIMIT 1',
+      [customerId]
+    );
+    if (!customers.length) {
+      return res.status(404).json({success: false, message: 'ไม่พบข้อมูลลูกค้า'});
+    }
+
+    const suspension = await getActiveSuspension('customer', customerId);
+    return res.json({
+      success: true,
+      status: suspension ? 'ระงับบัญชี' : 'ใช้งานปกติ',
+      code: suspension ? 'ACCOUNT_SUSPENDED' : 'ACCOUNT_ACTIVE',
+      reason: suspension?.reason || null,
+    });
+  } catch (err) {
+    console.error('Account status check error:', err);
+    return res.status(500).json({success: false, message: 'ตรวจสอบสถานะบัญชีไม่สำเร็จ'});
+  }
+});
+
+// ==========================================================
 // 3. POST /api/customers/reset-password
 // รีเซ็ตรหัสผ่าน
 // ==========================================================
@@ -293,6 +324,71 @@ router.get('/', async (req, res) => {
       message:
         'เกิดข้อผิดพลาดฝั่งเซิร์ฟเวอร์',
       error: err.message,
+    });
+  }
+});
+
+// ==========================================================
+// GET /api/customers/:id/points
+// แต้มสะสมของลูกค้า แยกตามร้านค้า
+// ==========================================================
+router.get('/:id/points', async (req, res) => {
+  try {
+    const customerId = req.params.id;
+
+    const { rows: balances } = await pool.query(
+      `SELECT
+         m.id AS merchant_id,
+         m.name AS merchant_name,
+         COALESCE(cmp.points_balance, 0) AS points_balance,
+         COALESCE(mls.is_enabled, 0) AS is_enabled,
+         COALESCE(mls.baht_per_point, 0) AS baht_per_point,
+         COALESCE(mls.points_for_discount, 0) AS points_for_discount,
+         COALESCE(mls.discount_amount, 0) AS discount_amount
+       FROM merchant m
+       LEFT JOIN customer_merchant_points cmp
+         ON cmp.merchant_id = m.id
+        AND cmp.customer_id = $1
+       LEFT JOIN merchant_loyalty_settings mls
+         ON mls.merchant_id = m.id
+       WHERE COALESCE(cmp.points_balance, 0) > 0
+          OR COALESCE(mls.is_enabled, 0) = 1
+       ORDER BY COALESCE(cmp.points_balance, 0) DESC, m.name ASC`,
+      [customerId]
+    );
+
+    const { rows: transactions } = await pool.query(
+      `SELECT
+         cpt.id,
+         cpt.merchant_id,
+         m.name AS merchant_name,
+         cpt.order_id,
+         cpt.type,
+         cpt.points,
+         cpt.amount,
+         cpt.note,
+         cpt.created_at
+       FROM customer_point_transactions cpt
+       LEFT JOIN merchant m ON m.id = cpt.merchant_id
+       WHERE cpt.customer_id = $1
+       ORDER BY cpt.created_at DESC
+       LIMIT 100`,
+      [customerId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        balances,
+        transactions,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching customer points:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถโหลดแต้มสะสมได้',
+      error: error.message,
     });
   }
 });

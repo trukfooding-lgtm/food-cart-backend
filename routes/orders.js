@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
 const { sendMerchantNotification } = require('../services/merchant_push_notification');
+const { uploadMenuImage } = require('../services/menuImageStorageService');
+const { getActiveSuspension } = require('../services/account_status');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -79,6 +81,131 @@ async function sendPushNotification(customerId, title, body) {
  }
 }
 
+function toPositiveInt(value, fallback = 0) {
+ const parsed = Number(value);
+ if (!Number.isFinite(parsed)) return fallback;
+ return Math.max(0, Math.floor(parsed));
+}
+
+function toMoney(value) {
+ const parsed = Number(value);
+ if (!Number.isFinite(parsed)) return 0;
+ return Math.round(parsed * 100) / 100;
+}
+
+function calculateItemsTotal(items) {
+ return toMoney((items || []).reduce((sum, item) => {
+  const qty = toPositiveInt(item.qty ?? item.quantity, 0);
+  const price = toMoney(item.price);
+  return sum + (qty * price);
+ }, 0));
+}
+
+async function refundOrderPointsOnce(connection, orderId) {
+ const { rows } = await connection.query(
+  `SELECT
+     id,
+     customer_id,
+     merchant_id,
+     COALESCE(points_used, 0) AS points_used,
+     points_refunded_at
+   FROM orders
+   WHERE id = $1
+   FOR UPDATE`,
+  [orderId]
+ );
+
+ if (rows.length === 0) return false;
+ const order = rows[0];
+ const pointsUsed = toPositiveInt(order.points_used, 0);
+ if (pointsUsed <= 0 || order.points_refunded_at) return false;
+
+ await connection.query(
+  `INSERT INTO customer_merchant_points
+    (customer_id, merchant_id, points_balance)
+   VALUES ($1, $2, $3)
+   ON CONFLICT (customer_id, merchant_id)
+   DO UPDATE SET
+     points_balance = customer_merchant_points.points_balance + EXCLUDED.points_balance,
+     updated_at = NOW()`,
+  [order.customer_id, order.merchant_id, pointsUsed]
+ );
+
+ await connection.query(
+  `INSERT INTO customer_point_transactions
+    (customer_id, merchant_id, order_id, type, points, amount, note)
+   VALUES ($1, $2, $3, 'REFUND', $4, 0, 'คืนแต้มจากคำสั่งซื้อที่ถูกยกเลิก')`,
+  [order.customer_id, order.merchant_id, orderId, pointsUsed]
+ );
+
+ await connection.query(
+  `UPDATE orders
+   SET points_refunded_at = NOW()
+   WHERE id = $1`,
+  [orderId]
+ );
+
+ return true;
+}
+
+async function awardOrderPointsOnce(connection, orderId) {
+ const { rows } = await connection.query(
+  `SELECT
+     o.id,
+     o.customer_id,
+     o.merchant_id,
+     COALESCE(o.final_total, o.total_price, 0) AS paid_total,
+     o.points_awarded_at,
+     COALESCE(mls.is_enabled, 0) AS is_enabled,
+     COALESCE(mls.baht_per_point, 0) AS baht_per_point
+   FROM orders o
+   LEFT JOIN merchant_loyalty_settings mls
+     ON mls.merchant_id = o.merchant_id
+   WHERE o.id = $1
+   FOR UPDATE OF o`,
+  [orderId]
+ );
+
+ if (rows.length === 0) return 0;
+ const order = rows[0];
+ if (order.points_awarded_at) return 0;
+ const bahtPerPoint = toPositiveInt(order.baht_per_point, 0);
+ const paidTotal = toMoney(order.paid_total);
+ const enabled = order.is_enabled === true || Number(order.is_enabled) === 1;
+ const pointsToAward = enabled && bahtPerPoint > 0
+  ? Math.floor(paidTotal / bahtPerPoint)
+  : 0;
+
+ if (pointsToAward > 0) {
+  await connection.query(
+   `INSERT INTO customer_merchant_points
+     (customer_id, merchant_id, points_balance)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (customer_id, merchant_id)
+    DO UPDATE SET
+      points_balance = customer_merchant_points.points_balance + EXCLUDED.points_balance,
+      updated_at = NOW()`,
+   [order.customer_id, order.merchant_id, pointsToAward]
+  );
+
+  await connection.query(
+   `INSERT INTO customer_point_transactions
+     (customer_id, merchant_id, order_id, type, points, amount, note)
+    VALUES ($1, $2, $3, 'EARN', $4, $5, 'ได้รับแต้มจากคำสั่งซื้อสำเร็จ')`,
+   [order.customer_id, order.merchant_id, orderId, pointsToAward, paidTotal]
+  );
+ }
+
+ await connection.query(
+  `UPDATE orders
+   SET points_awarded_at = NOW()
+   WHERE id = $1`,
+  [orderId]
+ );
+
+ return pointsToAward;
+}
+
 // ==========================================================
 // 1. POST /api/orders/create
 // ==========================================================
@@ -89,11 +216,11 @@ router.post('/create', async (req, res) => {
  total_price,
  status,
  items,
+ points_used,
  } = req.body;
 
  if (
  !customer_id ||
- !total_price ||
  !items ||
  items.length === 0
  ) {
@@ -102,27 +229,155 @@ router.post('/create', async (req, res) => {
  });
  }
 
+ let connection;
+
  try {
+ const suspension = await getActiveSuspension('customer', Number(customer_id));
+ if (suspension) {
+ return res.status(403).json({
+ success: false,
+ code: 'ACCOUNT_SUSPENDED',
+ message: `บัญชีถูกระงับเนื่องจาก: ${suspension.reason}`,
+ reason: suspension.reason,
+ });
+ }
+
+ connection = await pool.connect();
+ await connection.query('BEGIN');
+
  const orderStatus = status || 'รอชำระเงิน';
  const mId = merchant_id || 1;
+ const originalTotal = calculateItemsTotal(items);
+ const requestedPoints = toPositiveInt(points_used, 0);
 
- const orderResult = await pool.query(
+ if (originalTotal <= 0) {
+  await connection.query('ROLLBACK');
+  return res.status(400).json({
+   success: false,
+   message: 'ยอดคำสั่งซื้อไม่ถูกต้อง',
+  });
+ }
+
+ const { rows: settingRows } = await connection.query(
+  `SELECT
+     is_enabled,
+     baht_per_point,
+     points_for_discount,
+     discount_amount
+   FROM merchant_loyalty_settings
+   WHERE merchant_id = $1`,
+  [mId]
+ );
+
+ const setting = settingRows[0] || null;
+ const loyaltyEnabled = setting &&
+  (setting.is_enabled === true || Number(setting.is_enabled) === 1);
+ const pointsForDiscount = toPositiveInt(setting?.points_for_discount, 0);
+ const discountAmount = toMoney(setting?.discount_amount || 0);
+ const bahtPerPoint = toPositiveInt(setting?.baht_per_point, 0);
+ let pointsDiscount = 0;
+
+ if (requestedPoints > 0) {
+  if (!loyaltyEnabled || pointsForDiscount <= 0 || discountAmount <= 0) {
+   await connection.query('ROLLBACK');
+   return res.status(400).json({
+    success: false,
+    message: 'ร้านค้านี้ยังไม่เปิดใช้การแลกแต้ม',
+   });
+  }
+
+  if (requestedPoints % pointsForDiscount !== 0) {
+   await connection.query('ROLLBACK');
+   return res.status(400).json({
+    success: false,
+    message: `กรุณาใช้แต้มเป็นจำนวนเท่าของ ${pointsForDiscount}`,
+   });
+  }
+
+  await connection.query(
+   `INSERT INTO customer_merchant_points
+     (customer_id, merchant_id, points_balance)
+    VALUES ($1, $2, 0)
+    ON CONFLICT (customer_id, merchant_id) DO NOTHING`,
+   [customer_id, mId]
+  );
+
+  const { rows: pointRows } = await connection.query(
+   `SELECT points_balance
+    FROM customer_merchant_points
+    WHERE customer_id = $1
+      AND merchant_id = $2
+    FOR UPDATE`,
+   [customer_id, mId]
+  );
+
+  const currentBalance = toPositiveInt(pointRows[0]?.points_balance, 0);
+  if (requestedPoints > currentBalance) {
+   await connection.query('ROLLBACK');
+   return res.status(409).json({
+    success: false,
+    message: 'แต้มสะสมไม่เพียงพอ',
+   });
+  }
+
+  pointsDiscount = toMoney((requestedPoints / pointsForDiscount) * discountAmount);
+  if (pointsDiscount > originalTotal - 1) {
+   await connection.query('ROLLBACK');
+   return res.status(400).json({
+    success: false,
+    message: 'ส่วนลดจากแต้มต้องเหลือยอดชำระอย่างน้อย 1 บาท',
+   });
+  }
+
+  await connection.query(
+   `UPDATE customer_merchant_points
+    SET points_balance = points_balance - $1,
+        updated_at = NOW()
+    WHERE customer_id = $2
+      AND merchant_id = $3`,
+   [requestedPoints, customer_id, mId]
+  );
+ }
+
+ const finalTotal = toMoney(originalTotal - pointsDiscount);
+
+ const orderResult = await connection.query(
  `INSERT INTO orders
- (customer_id, merchant_id, total_price, status)
- VALUES ($1, $2, $3, $4)
+ (customer_id, merchant_id, total_price, status,
+  original_total, points_used, points_discount, final_total, loyalty_rate_snapshot)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
  RETURNING id`,
  [
  customer_id,
  mId,
- total_price,
+ finalTotal,
  orderStatus,
+ originalTotal,
+ requestedPoints,
+ pointsDiscount,
+ finalTotal,
+ JSON.stringify({
+  is_enabled: loyaltyEnabled,
+  baht_per_point: bahtPerPoint,
+  points_for_discount: pointsForDiscount,
+  discount_amount: discountAmount,
+ }),
  ]
  );
 
  const newOrderId = orderResult.rows[0].id;
 
+ if (requestedPoints > 0) {
+  await connection.query(
+   `INSERT INTO customer_point_transactions
+     (customer_id, merchant_id, order_id, type, points, amount, note)
+    VALUES ($1, $2, $3, 'REDEEM', $4, $5, 'ใช้แต้มเป็นส่วนลดคำสั่งซื้อ')`,
+   [customer_id, mId, newOrderId, requestedPoints, pointsDiscount]
+  );
+ }
+
  for (const item of items) {
- await pool.query(
+ await connection.query(
  `INSERT INTO order_items
  (order_id, item_name, quantity, price, note)
  VALUES ($1, $2, $3, $4, $5)`,
@@ -137,17 +392,28 @@ router.post('/create', async (req, res) => {
  }
 
  // ส่งออเดอร์เข้าตาราง merchant_orders ของร้านค้า
-await pool.query(
- 'INSERT INTO merchant_orders (source_order_id, merchant_id, customer_id, merchant_status) VALUES ($1, $2, $3, $4)',
- [newOrderId, mId, customer_id, 'ใหม่']
+ await connection.query(
+ `INSERT INTO merchant_orders
+   (source_order_id, merchant_id, customer_id, items_summary, total_price, merchant_status, ordered_at)
+  VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+ [
+  newOrderId,
+  mId,
+  customer_id,
+  items.map((item) => `${item.name} x${item.qty}`).join(', '),
+  finalTotal,
+  'ใหม่',
+ ]
 );
+
+ await connection.query('COMMIT');
 
  sendMerchantNotification({
  merchantId: mId,
  sourceType: 'order',
  sourceId: newOrderId,
  title: 'มีออเดอร์ใหม่',
- message: `ออเดอร์ #${newOrderId} ยอดรวม ${total_price} บาท`,
+ message: `ออเดอร์ #${newOrderId} ยอดรวม ${finalTotal} บาท`,
  data: {
  order_id: newOrderId
  }
@@ -160,10 +426,18 @@ await pool.query(
  );
 
  res.status(201).json({
+ success: true,
  message: 'สั่งอาหารสำเร็จ',
  orderId: newOrderId,
+ originalTotal,
+ pointsUsed: requestedPoints,
+ pointsDiscount,
+ finalTotal,
  });
  } catch (error) {
+ if (connection) {
+  await connection.query('ROLLBACK');
+ }
  console.error(
  'Error creating order:',
  error
@@ -173,6 +447,8 @@ await pool.query(
  message: 'เกิดข้อผิดพลาดที่เซิร์ฟเวอร์',
  error: error.message,
  });
+ } finally {
+ connection?.release();
  }
 });
 
@@ -192,7 +468,13 @@ router.get(
  'ร้านค้าทั่วไป'
  ) AS merchant_name,
  o.total_price,
+ o.original_total,
+ o.points_used,
+ o.points_discount,
+ o.final_total,
+ o.loyalty_rate_snapshot,
  o.status,
+ mo.merchant_status,
  o.refund_status,
  o.created_at,
  mo.prep_minutes,
@@ -235,6 +517,16 @@ router.get(
  row.merchant_name,
  total_price:
  row.total_price,
+ original_total:
+ row.original_total,
+ points_used:
+ row.points_used,
+ points_discount:
+ row.points_discount,
+ final_total:
+ row.final_total,
+ loyalty_rate_snapshot:
+ row.loyalty_rate_snapshot,
  status: row.status,
  refund_status:
  row.refund_status,
@@ -294,8 +586,10 @@ router.get(
 router.get('/:id', async (req, res) => {
  try {
  const { rows } = await pool.query(
- `SELECT
- o.*,
+  `SELECT
+  o.*,
+  o.status AS customer_order_status,
+  mo.merchant_status,
  mo.prep_minutes,
  mo.reject_reason,
  mo.rejected_at
@@ -405,6 +699,8 @@ router.put('/:id/cancel', async (req, res) => {
  [orderId]
  );
 
+ await refundOrderPointsOnce(connection, orderId);
+
  await connection.query('COMMIT');
 
  await sendMerchantNotification({
@@ -445,19 +741,22 @@ router.put('/:id/cancel', async (req, res) => {
 router.put(
  '/:id/complete',
  async (req, res) => {
+ let connection;
  try {
  const orderId = req.params.id;
+ connection = await pool.connect();
+ await connection.query('BEGIN');
 
  const {
  rows: orderRows,
- } = await pool.query(
+ } = await connection.query(
  `SELECT customer_id, merchant_id
  FROM orders
  WHERE id = $1`,
  [orderId]
  );
 
- const result = await pool.query(
+ const result = await connection.query(
  `UPDATE orders
  SET status = 'รับอาหารสำเร็จแล้ว'
  WHERE id = $1`,
@@ -465,12 +764,16 @@ router.put(
  );
 
  if (result.rowCount === 0) {
+ await connection.query('ROLLBACK');
  return res.status(404).json({
  success: false,
  message:
  'ไม่พบออเดอร์นี้ในระบบ',
  });
  }
+
+ const awardedPoints = await awardOrderPointsOnce(connection, orderId);
+ await connection.query('COMMIT');
 
  if (orderRows.length > 0) {
  await sendPushNotification(
@@ -494,10 +797,14 @@ router.put(
 
  res.json({
  success: true,
+ awardedPoints,
  message:
  'อัปเดตสถานะสำเร็จ',
  });
  } catch (error) {
+ if (connection) {
+ await connection.query('ROLLBACK');
+ }
  console.error(
  'Error completing order:',
  error
@@ -508,6 +815,8 @@ router.put(
  message: 'Server Error',
  error: error.message,
  });
+ } finally {
+ connection?.release();
  }
  }
 );
@@ -619,10 +928,14 @@ const upload = multer({
  storage,
 });
 
+const menuImageUpload = multer({
+ storage: multer.memoryStorage(),
+});
+
 router.post(
  '/upload-image',
- upload.single('image'),
- function (req, res) {
+ menuImageUpload.single('image'),
+ async function (req, res) {
  if (!req.file) {
  return res.status(400).json({
  success: false,
@@ -631,14 +944,24 @@ router.post(
  });
  }
 
- const imageUrl =
- `${req.protocol}://${req.get('host')}` +
- `/uploads/${req.file.filename}`;
+ try {
+ const imageUrl = await uploadMenuImage({
+  fileName: req.file.originalname,
+  buffer: req.file.buffer,
+  contentType: req.file.mimetype,
+ });
 
- res.json({
+ return res.json({
  success: true,
  url: imageUrl,
  });
+ } catch (error) {
+ console.error('Menu image upload failed:', error.message);
+ return res.status(500).json({
+  success: false,
+  message: 'บันทึกรูปเมนูไม่สำเร็จ',
+ });
+ }
  }
 );
 
@@ -854,8 +1177,80 @@ function parsedFloatOrNull(value) {
  return Number.isFinite(parsed) ? parsed : null;
 }
 
+// เก็บหลักฐานสลิปไว้ให้ร้านค้าเปิดตรวจสอบย้อนหลังได้
+// โดยไม่ลบหลักฐานเดิม และไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้วเอง
+async function insertSlipRecord({
+ orderId,
+ customerId,
+ slipUrl,
+ expectedAmount,
+ detectedAmount,
+ status,
+ reason,
+ ocrText,
+ transactionId,
+ verifiedAt = null,
+ throwOnError = false,
+}) {
+ const fallbackSlipId = `${status}_${orderId}_${Date.now()}`;
+
+ try {
+   const { rows: insertedSlipRows } = await pool.query(
+     `INSERT INTO order_slips
+       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
+        detected_amount, status, note, validation_reason, ocr_text,
+        transaction_id, payment_channel, verified_at)
+      VALUES
+       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, $7, $8, $8, $9,
+        $10, NULL, $11)
+       RETURNING id`,
+     [
+       String(orderId),
+       customerId,
+       slipUrl,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       Number.isFinite(expectedAmount) ? expectedAmount : null,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       status,
+       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
+       String(ocrText || '').slice(0, 8000),
+       transactionId || `${status}_${orderId}_${Date.now()}`,
+       verifiedAt,
+     ],
+   );
+
+   return insertedSlipRows[0]?.id != null
+     ? String(insertedSlipRows[0].id)
+     : fallbackSlipId;
+ } catch (error) {
+   if (throwOnError) throw error;
+   // การบันทึกหลักฐานสลิปผิดปกติต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
+   console.warn('Slip record warning:', error.message);
+   return fallbackSlipId;
+ }
+}
+
+// ทำให้ออร์เดอร์ฝั่งร้านเข้าสู่รายการตรวจสอบเมื่อมีสลิปส่งเข้ามาแล้ว
+// โดยไม่เปลี่ยนสถานะหรือข้อมูลออร์เดอร์ฝั่งลูกค้า
+async function markMerchantOrderForSlipReview({ orderId, merchantId }) {
+ if (merchantId == null) return;
+
+ try {
+   await pool.query(
+     `UPDATE merchant_orders
+      SET merchant_status = 'รอตรวจสอบ', updated_at = NOW()
+      WHERE source_order_id = $1
+        AND merchant_id = $2
+        AND merchant_status IN ('ใหม่', 'รอชำระเงิน')`,
+     [orderId, merchantId],
+   );
+ } catch (error) {
+   console.warn('Merchant slip review status warning:', error.message);
+ }
+}
+
 // เก็บสลิปที่ตรวจไม่ผ่านไว้ให้ร้านค้าเปิดตรวจสอบและรายงานได้
-// โดยไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้ว
+// โดยคงพฤติกรรมแจ้งเตือนร้านเดิมไว้
 async function recordRejectedSlip({
  orderId,
  customerId,
@@ -865,39 +1260,20 @@ async function recordRejectedSlip({
  detectedAmount,
  reason,
  ocrText,
- }) {
- let slipNotificationId = `attempt-${Date.now()}`;
+}) {
+ const slipNotificationId = await insertSlipRecord({
+   orderId,
+   customerId,
+   slipUrl,
+   expectedAmount,
+   detectedAmount,
+   status: 'REJECTED',
+   reason,
+   ocrText,
+   transactionId: `REJECTED_${orderId}_${Date.now()}`,
+ });
 
- try {
-   const { rows: insertedSlipRows } = await pool.query(
-     `INSERT INTO order_slips
-       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
-        detected_amount, status, note, validation_reason, ocr_text,
-        transaction_id, payment_channel, verified_at)
-      VALUES
-       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, 'REJECTED', $7, $7, $8,
-        $9, NULL, NULL)
-       RETURNING id`,
-     [
-       String(orderId),
-       customerId,
-       slipUrl,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       Number.isFinite(expectedAmount) ? expectedAmount : null,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
-       String(ocrText || '').slice(0, 8000),
-       `REJECTED_${orderId}_${Date.now()}`,
-     ],
-   );
-
-   if (insertedSlipRows[0]?.id != null) {
-     slipNotificationId = String(insertedSlipRows[0].id);
-   }
- } catch (error) {
-   // การบันทึกหลักฐานต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
-   console.warn('Rejected slip record warning:', error.message);
- }
+ await markMerchantOrderForSlipReview({ orderId, merchantId });
 
  try {
    await sendMerchantNotification({
@@ -1053,8 +1429,14 @@ router.post(
       async function updateOrderStatusSafely(statusVal) {
         try {
           await pool.query(
-            'UPDATE orders SET status = $1, slip_url = $2 WHERE id = $3',
-            [statusVal, slipUrl, orderId]
+            `UPDATE orders
+             SET status = $1,
+                 slip_url = $2,
+                 transaction_id = CASE WHEN $1 = 'ชำระเงินแล้ว' THEN $3 ELSE transaction_id END,
+                 paid_at = CASE WHEN $1 = 'ชำระเงินแล้ว' THEN NOW() ELSE paid_at END,
+                 updated_at = NOW()
+             WHERE id = $4`,
+            [statusVal, slipUrl, transactionId || `TX-${Date.now()}`, orderId]
           );
         } catch (_) {
           await pool.query(
@@ -1071,6 +1453,24 @@ router.post(
         !normTxId
       ) {
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
+        await markMerchantOrderForSlipReview({ orderId, merchantId: mId });
+
+        // กรณีที่ยังไม่ผ่านการตรวจสอบอัตโนมัติ ต้องเก็บสลิปไว้ให้ร้านค้า
+        // เปิดดูและตัดสินใจได้ โดยไม่เรียกแจ้งเตือนซ้ำกับกรณี UNREADABLE
+        let reviewSlipId;
+        if (!isUnreadableSlip) {
+          reviewSlipId = await insertSlipRecord({
+            orderId,
+            customerId,
+            slipUrl,
+            expectedAmount: dbOrderTotal,
+            detectedAmount: parsedDetectedAmount,
+            status: 'REJECTED',
+            reason: 'สลิปยังไม่ผ่านการตรวจสอบอัตโนมัติ กรุณาให้ร้านค้าตรวจสอบ',
+            ocrText,
+            transactionId: `REJECTED_${orderId}_${Date.now()}`,
+          });
+        }
 
         await sendPushNotification(
           customerId,
@@ -1083,9 +1483,14 @@ router.post(
             await sendMerchantNotification({
               merchantId: mId,
               sourceType: 'payment_slip_review',
-              sourceId: orderId,
+              sourceId: `${orderId}:${reviewSlipId || 'latest'}`,
               title: 'มีสลิปรอตรวจสอบ',
               message: `ออเดอร์ #${orderId} ลูกค้าแนบสลิปแล้ว กรุณาตรวจสอบยอดเงิน ฿${dbOrderTotal.toFixed(2)}`,
+              data: {
+                order_id: orderId,
+                slip_id: reviewSlipId,
+                payment_status: 'REJECTED',
+              },
             });
           } catch (e) {
             console.warn('Merchant notification warning:', e.message);
@@ -1100,8 +1505,32 @@ router.post(
       }
 
       // Layer 6: เมื่อผ่านครบทุกชั้นอย่างสมบูรณ์ (VERIFIED)
+      // บันทึกสลิปก่อนเปลี่ยนสถานะออเดอร์ เพื่อให้ร้านเปิดดูย้อนหลัง
+      // และรายงานได้ แม้ระบบจะตรวจผ่านอัตโนมัติแล้ว
+      await insertSlipRecord({
+        orderId,
+        customerId,
+        slipUrl,
+        expectedAmount: dbOrderTotal,
+        detectedAmount: parsedDetectedAmount,
+        status: 'VERIFIED',
+        reason: 'ระบบตรวจสอบสลิปผ่านแล้ว',
+        ocrText,
+        transactionId: transactionId || `VERIFIED_${orderId}_${Date.now()}`,
+        verifiedAt: new Date(),
+        throwOnError: true,
+      });
       usedSlipTransactions.add(normTxId);
       await updateOrderStatusSafely('ชำระเงินแล้ว');
+      await pool.query(
+        `UPDATE merchant_orders
+         SET merchant_status = 'กำลังปรุง',
+             updated_at = NOW()
+         WHERE source_order_id = $1
+           AND merchant_id = $2
+           AND merchant_status IN ('รอชำระเงิน', 'ชำระเงินแล้ว')`,
+        [orderId, mId]
+      );
 
       await sendPushNotification(
         customerId,
