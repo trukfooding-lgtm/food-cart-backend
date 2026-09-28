@@ -68,7 +68,6 @@ app.use('/api/orders', ordersRoutes);
 // fallback so rejected slips are persisted and sent to the merchant review flow.
 app.use('/api', paymentRoutes);
 app.use('/api/internal', internalAccountStatusRoutes);
-
 app.post('/api/otp/send', async (req, res) => {
   const recipientEmail =
     typeof req.body?.email === 'string' ? req.body.email.trim() : '';

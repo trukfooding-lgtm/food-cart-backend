@@ -11,10 +11,16 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const crypto = require('crypto');
-const fs = require('fs/promises');
 const path = require('path');
 const { generatePromptPayPayload } = require('../services/promptPayService');
 const { sendMerchantNotification } = require('../../services/merchant_push_notification');
+const {
+  SlipStorageError,
+  uploadPaymentSlip,
+  getPaymentSlipUrl,
+  deletePaymentSlip
+} = require('../services/slipStorageService');
+const { getSlipOkConfigState, verifySlipWithSlipOk } = require('../services/slipOkService');
 
 const { createWorker } = require('tesseract.js');
 let pool = null;
@@ -53,8 +59,6 @@ const BANK_MAP = {
   'GSB': 'ธนาคารออมสิน'
 };
 
-const slipUploadDirectory = path.resolve(__dirname, '../../uploads/slips');
-
 function normalisePaymentType(value) {
   return String(value || '').trim().toUpperCase() === 'PROMPTPAY'
     ? 'PROMPTPAY'
@@ -81,6 +85,13 @@ function getFileExtension(file) {
     'image/webp': 'webp'
   };
   return byMimeType[file.mimetype] || 'jpg';
+}
+
+function addDetectedSlipAmount(amounts, rawAmount) {
+  const detectedAmount = Number(rawAmount.replace(/,/g, ''));
+  if (detectedAmount > 0 && detectedAmount <= 1000000 && !amounts.includes(detectedAmount)) {
+    amounts.push(detectedAmount);
+  }
 }
 
 function formatReportAmount(value) {
@@ -121,6 +132,41 @@ function buildVerifiedPaymentReportDetails(orderId, slip) {
 
 const SERVER_OCR_TIMEOUT_MS = 20_000;
 
+function extractLabeledSlipAmounts(lines) {
+  const label = /ยอด(?:โอน|ชำระ|เงิน)|จำนวนเงิน|amount|transfer(?:red)?|total/i;
+  const amount = /(?:ยอด(?:โอน|ชำระ|เงิน)|จำนวนเงิน|amount|transfer(?:red)?|total)\s*[:：]?\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)/gi;
+  const amounts = [];
+
+  for (let index = 0; index < lines.length; index++) {
+    if (!label.test(lines[index])) continue;
+    const context = [lines[index], lines[index + 1]].filter(Boolean).join(' ');
+    amount.lastIndex = 0;
+    for (const match of context.matchAll(amount)) addDetectedSlipAmount(amounts, match[1]);
+  }
+  return amounts;
+}
+
+function extractCurrencySlipAmounts(lines) {
+  const currencyAmount = /฿\s*([0-9][0-9,]*(?:[.,][0-9]{1,2})?)|([0-9][0-9,]*(?:[.,][0-9]{1,2})?)\s*(?:บาท|\bTHB\b)/gi;
+  const otherNumberField = /ค่าธรรมเนียม|\bfee\b|บัญชี|account|วันที่|เวลา|\bdate\b|\btime\b|ref(?:erence)?|transaction|รหัส|เบอร์|phone/i;
+  const amounts = [];
+
+  for (const line of lines) {
+    if (otherNumberField.test(line)) continue;
+    currencyAmount.lastIndex = 0;
+    for (const match of line.matchAll(currencyAmount)) {
+      addDetectedSlipAmount(amounts, match[1] || match[2]);
+    }
+  }
+  return amounts;
+}
+
+function extractSlipAmounts(ocrText) {
+  const lines = ocrText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const labeledAmounts = extractLabeledSlipAmounts(lines);
+  return labeledAmounts.length > 0 ? labeledAmounts : extractCurrencySlipAmounts(lines);
+}
+
 async function performServerOcr(imageBuffer, expectedAmount) {
   let worker = null;
   let timedOut = false;
@@ -135,28 +181,19 @@ async function performServerOcr(imageBuffer, expectedAmount) {
     const task = (async () => {
       worker = await createWorker('tha+eng');
       if (timedOut) throw new Error('Server OCR timed out before worker initialization completed');
-      const { data: { text } } = await worker.recognize(imageBuffer);
-      return text;
+      return worker.recognize(imageBuffer);
     })();
-    const text = await Promise.race([task, timeout]);
-
-    const normalized = String(text || '').replace(/[๐-๙]/g, d => '0123456789'['๐๑๒๓๔๕๖๗๘๙'.indexOf(d)]).replaceAll('\u00a0', ' ');
-    const amountPattern = /(?<!\d)(\d{1,3}(?:[,\s]\d{3})*|\d+)(?:[.,](\d{1,2}))?(?!\d)/g;
+    const { data } = await Promise.race([task, timeout]);
+    const normalized = String(data.text || '')
+      .replace(/[๐-๙]/g, digit => '0123456789'['๐๑๒๓๔๕๖๗๘๙'.indexOf(digit)])
+      .replaceAll('\u00a0', ' ')
+      .trim();
     const exp = Number(expectedAmount);
-    const candidates = [];
+    const confidence = Number(data.confidence) || 0;
+    const candidates = extractSlipAmounts(normalized);
+    const matching = candidates.find(amount => Math.abs(amount - exp) < 0.01);
 
-    let match;
-    while ((match = amountPattern.exec(normalized)) !== null) {
-      const whole = match[1].replace(/[,\s]/g, '');
-      const fraction = (match[2] || '').padEnd(2, '0');
-      const val = parseFloat(fraction ? `${whole}.${fraction}` : whole);
-      if (val && val > 0 && val <= 1000000) {
-        candidates.push(val);
-      }
-    }
-
-    const matching = candidates.find(a => Math.abs(a - exp) < 0.01);
-    if (matching) {
+    if (matching && confidence >= 70) {
       return {
         verified: true,
         detectedAmount: matching,
@@ -169,23 +206,51 @@ async function performServerOcr(imageBuffer, expectedAmount) {
     const closest = candidates.length > 0
       ? candidates.reduce((prev, curr) => Math.abs(curr - exp) < Math.abs(prev - exp) ? curr : prev)
       : null;
+    const needsReview = confidence < 70;
 
     return {
       verified: false,
       detectedAmount: closest,
-      ocrStatus: candidates.length > 0 ? 'REJECTED' : 'UNREADABLE',
+      ocrStatus: candidates.length > 0 && !needsReview ? 'REJECTED' : 'UNREADABLE',
       ocrText: normalized,
-      reason: candidates.length > 0
+      reason: needsReview
+        ? 'ผลอ่านสลิปยังไม่มั่นใจ กรุณาให้ร้านค้าตรวจสอบหลักฐาน'
+        : candidates.length > 0
         ? `ยอดจากสลิป ฿${closest.toFixed(2)} ไม่ตรงกับยอดที่ต้องชำระ ฿${exp.toFixed(2)}`
-        : 'ระบบเซิร์ฟเวอร์อ่านยอดเงินจากสลิปไม่ได้ กรุณาแนบสลิปที่ชัดเจน'
+        : 'ระบบอ่านยอดชำระบนสลิปไม่ชัด กรุณาให้ร้านค้าตรวจสอบหลักฐาน'
     };
   } catch (err) {
     console.error('⚠️ [Server OCR Error]:', err.message);
     return null;
   } finally {
     clearTimeout(timeoutId);
-    if (worker) await worker.terminate().catch(() => {});
+    if (worker) {
+      try {
+        await worker.terminate();
+      } catch (err) {
+        console.warn('⚠️ [Server OCR Cleanup]:', err.message);
+      }
+    }
   }
+}
+
+function normalizeRecipientText(value) {
+  return String(value || '').toLocaleLowerCase('th-TH').replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+function recipientMatchesSlip(ocrText, merchant) {
+  const normalizedText = normalizeRecipientText(ocrText);
+  const textDigits = String(ocrText || '').replace(/\D/g, '');
+  const names = [
+    merchant?.recipientName,
+    merchant?.name
+  ].map(normalizeRecipientText).filter(name => name.length >= 4);
+  const identifiers = (merchant?.recipientIdentifiers || [])
+    .map(value => String(value || '').replace(/\D/g, ''))
+    .filter(value => value.length >= 4);
+
+  if (names.some(name => normalizedText.includes(name))) return true;
+  return identifiers.some(identifier => textDigits.includes(identifier.slice(-4)));
 }
 
 function evaluateClientOcr({ expectedAmount, detectedAmount, ocrStatus, ocrText }) {
@@ -273,12 +338,14 @@ async function getMerchantPaymentConfig(merchantId) {
         const bankCode = (acc.bank_code || acc.bank || 'KBANK').toUpperCase();
         const bankName = acc.bank_name || BANK_MAP[bankCode] || 'ธนาคารกสิกรไทย';
         const accNo = acc.account_number || acc.account_no || '';
-        const accName = acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
+        const accName = acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck';
         const promptpay = acc.promptpay_id || acc.promptpay_number || acc.promptpay || '';
 
         return {
           id: cleanId,
           name: merchantInfo?.name || merchantInfo?.title || 'ร้านค้า Food Truck',
+          recipientName: acc.receiver_name || acc.account_name || acc.holder_name || merchantInfo?.name || merchantInfo?.title || '',
+          recipientIdentifiers: [paymentType === 'PROMPTPAY' ? promptpay : accNo],
           primaryChannel: paymentType,
           promptpay: paymentType === 'PROMPTPAY' ? promptpay : '',
           bankAccount: paymentType === 'BANK_ACCOUNT' && accNo ? {
@@ -298,6 +365,8 @@ async function getMerchantPaymentConfig(merchantId) {
   return {
     id: cleanId,
     name: 'ร้านค้า',
+    recipientName: '',
+    recipientIdentifiers: [],
     promptpay: '',
     primaryChannel: null,
     bankAccount: null
@@ -320,7 +389,14 @@ async function handleGetPaymentInfo(req, res) {
     if (pool) {
       try {
         const orderRes = await pool.query(
-          `SELECT id, total_price, merchant_id, status, payment_deadline
+          `SELECT id,
+                  COALESCE(
+                    NULLIF(final_total, 0),
+                    NULLIF(total_price, 0),
+                    original_total,
+                    0
+                  ) AS total_price,
+                  merchant_id, status, payment_deadline
            FROM orders
            WHERE id = $1
            LIMIT 1`,
@@ -457,18 +533,50 @@ async function handlePostPaymentSlip(req, res) {
     }
 
     const merchant = await getMerchantPaymentConfig(order.merchant_id);
-    // ตรวจจากไฟล์ภาพบน Backend เท่านั้น ห้ามเชื่อค่า OCR/ยอดเงินที่ client ส่งมา
-    // เพื่อป้องกันการปลอมค่าให้สลิปที่ไม่ผ่านกลายเป็นสลิปผ่าน
-    console.log('🔍 [Server OCR] Executing server-side OCR on slip image...');
-    const verification = await performServerOcr(req.file.buffer, expectedAmount) || {
-      verified: false,
-      detectedAmount: null,
-      ocrStatus: 'UNREADABLE',
-      ocrText: '',
-      reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาแนบสลิปจริงที่ชัดเจน'
-    };
+    // ถ้าตั้งค่า SlipOK แล้ว ให้ตรวจ QR/ยอด/บัญชีผู้รับจากผู้ให้บริการก่อน
+    // กรณียังไม่ตั้งค่า จะคง OCR เดิมไว้เพื่อไม่ให้ระบบเดิมหยุดทำงาน
+    const slipOkConfig = getSlipOkConfigState();
+    let verification;
+    if (slipOkConfig === 'configured') {
+      verification = await verifySlipWithSlipOk({
+        buffer: req.file.buffer,
+        expectedAmount,
+        fileName: `slip.${getFileExtension(req.file)}`,
+        contentType: req.file.mimetype,
+        merchant
+      });
+    } else if (slipOkConfig === 'incomplete') {
+      verification = {
+        verified: false,
+        manualReview: true,
+        detectedAmount: null,
+        transactionId: null,
+        ocrStatus: 'MANUAL_REVIEW',
+        ocrText: '',
+        reason: 'ตั้งค่า SlipOK ไม่ครบ กรุณาให้ร้านตรวจสอบหลักฐาน'
+      };
+    } else {
+      console.log('🔍 [Server OCR] SlipOK is not configured; using the existing OCR flow.');
+      verification = await performServerOcr(req.file.buffer, expectedAmount) || {
+        verified: false,
+        manualReview: true,
+        detectedAmount: null,
+        transactionId: null,
+        ocrStatus: 'MANUAL_REVIEW',
+        ocrText: '',
+        reason: 'ระบบเซิร์ฟเวอร์ไม่สามารถอ่านสลิปได้ กรุณาให้ร้านตรวจสอบหลักฐาน'
+      };
 
-    const transactionId = `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
+      if (verification.verified && !recipientMatchesSlip(verification.ocrText, merchant)) {
+        verification.verified = false;
+        verification.manualReview = true;
+        verification.ocrStatus = 'MANUAL_REVIEW';
+        verification.reason = 'ยังยืนยันชื่อหรือบัญชีผู้รับเงินจากสลิปกับข้อมูลร้านค้าไม่ได้ กรุณาให้ร้านตรวจสอบสลิป';
+      }
+    }
+
+    const transactionId = verification.transactionId ||
+      `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
 
     const { rows: duplicateSlips } = await connection.query(
       'SELECT id, order_id FROM order_slips WHERE transaction_id = $1 LIMIT 1',
@@ -483,12 +591,16 @@ async function handlePostPaymentSlip(req, res) {
       });
     }
 
-    await fs.mkdir(slipUploadDirectory, { recursive: true });
     const fileName = `order-${cleanOrderId}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${getFileExtension(req.file)}`;
-    savedFilePath = path.join(slipUploadDirectory, fileName);
-    await fs.writeFile(savedFilePath, req.file.buffer);
-    const slipUrl = publicSlipUrl(req, fileName);
-    const slipStatus = verification.verified ? 'VERIFIED' : 'REJECTED';
+    savedSlipLocation = await uploadPaymentSlip({
+      orderId: cleanOrderId,
+      fileName,
+      buffer: req.file.buffer,
+      contentType: req.file.mimetype
+    });
+    const slipStatus = verification.verified
+      ? 'VERIFIED'
+      : verification.manualReview ? 'MANUAL_REVIEW' : 'REJECTED';
 
     await connection.query(
       `INSERT INTO order_slips
@@ -501,17 +613,41 @@ async function handlePostPaymentSlip(req, res) {
       [
         cleanOrderId,
         order.customer_id,
-        slipUrl,
+        savedSlipLocation,
         verification.detectedAmount,
         expectedAmount,
         verification.detectedAmount,
         slipStatus,
         verification.reason,
-        String(req.body.ocrText || '').slice(0, 8000),
+        String(verification.ocrText || '').slice(0, 8000),
         transactionId,
         merchant.primaryChannel
       ]
     );
+
+    if (verification.manualReview) {
+      await connection.query(
+        `UPDATE orders
+         SET status = 'รอตรวจสอบการชำระเงิน', updated_at = NOW()
+         WHERE id = $1`,
+        [cleanOrderId]
+      );
+      await connection.query('COMMIT');
+      await sendMerchantNotification({
+        merchantId: order.merchant_id,
+        sourceType: 'payment_issue',
+        sourceId: cleanOrderId,
+        title: 'มีสลิปรอตรวจสอบ',
+        message: `ออเดอร์ #${cleanOrderId}: ${verification.reason}`,
+        data: { order_id: cleanOrderId, payment_status: 'MANUAL_REVIEW' }
+      });
+      return res.json({
+        success: true,
+        status: 'MANUAL_REVIEW',
+        message: 'ส่งหลักฐานให้ร้านตรวจสอบแล้ว ยังไม่ยืนยันการชำระเงิน',
+        detectedAmount: verification.detectedAmount
+      });
+    }
 
     if (!verification.verified) {
       await connection.query('COMMIT');
@@ -543,7 +679,7 @@ async function handlePostPaymentSlip(req, res) {
     );
     await connection.query(
       `UPDATE merchant_orders
-       SET merchant_status = 'ชำระเงินแล้ว', updated_at = NOW()
+       SET merchant_status = 'กำลังปรุง', updated_at = NOW()
        WHERE source_order_id = $1 AND merchant_id = $2`,
       [cleanOrderId, order.merchant_id]
     );
@@ -554,7 +690,7 @@ async function handlePostPaymentSlip(req, res) {
       sourceType: 'payment_verified',
       sourceId: cleanOrderId,
       title: 'ลูกค้าชำระเงินแล้ว',
-      message: `ออเดอร์ #${cleanOrderId} ยอด ฿${expectedAmount.toFixed(2)} ตรวจสอบสลิปผ่านแล้ว กรุณาตรวจสอบและกดยืนยันรับสลิป`,
+      message: `ออเดอร์ #${cleanOrderId} ยอด ฿${expectedAmount.toFixed(2)} ตรวจสอบสลิปผ่านแล้ว สถานะเป็นกำลังปรุง สามารถเปิดดูหลักฐานย้อนหลังได้`,
       data: { order_id: cleanOrderId, payment_status: 'VERIFIED' }
     });
 
