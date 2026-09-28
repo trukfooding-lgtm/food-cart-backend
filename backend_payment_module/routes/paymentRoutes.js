@@ -692,11 +692,11 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/cancel-and-repo
       });
     }
 
-    if (Number(slip.rejected_slip_count || 0) < 2) {
+    if (Number(slip.rejected_slip_count || 0) < 4) {
       await connection.query('ROLLBACK');
       return res.status(409).json({
         success: false,
-        message: 'ต้องพบสลิปผิดปกติซ้ำอย่างน้อย 2 ครั้งก่อนยกเลิกออเดอร์',
+        message: 'ต้องพบสลิปผิดปกติอย่างน้อย 4 ครั้งก่อนยกเลิกออเดอร์',
       });
     }
 
