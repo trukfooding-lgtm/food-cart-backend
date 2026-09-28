@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../config/db');
 const { sendMerchantNotification } = require('../services/merchant_push_notification');
 const { uploadMenuImage } = require('../services/menuImageStorageService');
+const { getActiveSuspension } = require('../services/account_status');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -231,6 +232,16 @@ router.post('/create', async (req, res) => {
  let connection;
 
  try {
+ const suspension = await getActiveSuspension('customer', Number(customer_id));
+ if (suspension) {
+ return res.status(403).json({
+ success: false,
+ code: 'ACCOUNT_SUSPENDED',
+ message: `บัญชีถูกระงับเนื่องจาก: ${suspension.reason}`,
+ reason: suspension.reason,
+ });
+ }
+
  connection = await pool.connect();
  await connection.query('BEGIN');
 

@@ -201,6 +201,37 @@ router.post('/login', async (req, res) => {
 });
 
 // ==========================================================
+// ตรวจสอบสถานะบัญชีลูกค้าระหว่างเปิดแอป
+// ==========================================================
+router.get('/:id/account-status', async (req, res) => {
+  try {
+    const customerId = Number(req.params.id);
+    if (!Number.isInteger(customerId) || customerId <= 0) {
+      return res.status(400).json({success: false, message: 'รหัสลูกค้าไม่ถูกต้อง'});
+    }
+
+    const {rows: customers} = await pool.query(
+      'SELECT customer_id FROM customer WHERE customer_id = $1 LIMIT 1',
+      [customerId]
+    );
+    if (!customers.length) {
+      return res.status(404).json({success: false, message: 'ไม่พบข้อมูลลูกค้า'});
+    }
+
+    const suspension = await getActiveSuspension('customer', customerId);
+    return res.json({
+      success: true,
+      status: suspension ? 'ระงับบัญชี' : 'ใช้งานปกติ',
+      code: suspension ? 'ACCOUNT_SUSPENDED' : 'ACCOUNT_ACTIVE',
+      reason: suspension?.reason || null,
+    });
+  } catch (err) {
+    console.error('Account status check error:', err);
+    return res.status(500).json({success: false, message: 'ตรวจสอบสถานะบัญชีไม่สำเร็จ'});
+  }
+});
+
+// ==========================================================
 // 3. POST /api/customers/reset-password
 // รีเซ็ตรหัสผ่าน
 // ==========================================================
