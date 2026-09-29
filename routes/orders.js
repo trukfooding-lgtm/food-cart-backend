@@ -589,6 +589,14 @@ router.get('/:id', async (req, res) => {
   `SELECT
   o.*,
   o.status AS customer_order_status,
+  (
+   SELECT os.status
+   FROM order_slips os
+   WHERE os.order_id = o.id::text
+     AND os.uploader_type = 'CUSTOMER'
+   ORDER BY os.created_at DESC, os.id DESC
+   LIMIT 1
+  ) AS latest_slip_status,
   mo.merchant_status,
  mo.prep_minutes,
  mo.reject_reason,
