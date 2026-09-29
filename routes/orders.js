@@ -597,6 +597,25 @@ router.get('/:id', async (req, res) => {
    ORDER BY os.created_at DESC, os.id DESC
    LIMIT 1
   ) AS latest_slip_status,
+  COALESCE((
+   SELECT CASE
+    WHEN latest_customer_slip.status IN ('REJECTED', 'UNREADABLE', 'MANUAL_REVIEW')
+    THEN EXISTS (
+     SELECT 1
+     FROM merchant_issue_reports slip_report
+     WHERE slip_report.merchant_id = o.merchant_id
+       AND slip_report.issue_type = 'SLIP_MISMATCH'
+       AND slip_report.order_reference = 'ORD-' || o.id::text
+       AND slip_report.created_at >= latest_customer_slip.created_at
+    )
+    ELSE FALSE
+   END
+   FROM order_slips latest_customer_slip
+   WHERE latest_customer_slip.order_id = o.id::text
+     AND latest_customer_slip.uploader_type = 'CUSTOMER'
+   ORDER BY latest_customer_slip.created_at DESC, latest_customer_slip.id DESC
+   LIMIT 1
+  ), FALSE) AS can_resubmit_slip,
   mo.merchant_status,
  mo.prep_minutes,
  mo.reject_reason,

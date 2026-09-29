@@ -10,6 +10,11 @@ let slipOkState = 'not-configured';
 let slipOkResult;
 let failMerchantNotification = false;
 let deletedSlipLocations = [];
+let orderTransactions = [];
+let previousSlipForUpload = null;
+let slipVerificationArgs;
+let duplicateOnInsert = false;
+let insertError = null;
 let orderDetailsResult = {
   id: 42,
   customer_order_status: 'รอชำระเงิน',
@@ -24,14 +29,31 @@ const pool = {
         calls.push({ sql, values });
         if (sql.includes('FROM orders') && sql.includes('FOR UPDATE')) {
           return { rows: [{ id: 42, customer_id: orderCustomerId, merchant_id: 8,
-            total_price: 25, status: 'รอชำระเงิน', payment_deadline: null }] };
+            total_price: 25, status: 'รอชำระเงิน',
+            created_at: '2026-09-30T03:00:00.000Z',
+            payment_deadline: '2026-09-30T03:05:00.000Z' }] };
         }
-        if (sql.includes('SELECT id, order_id FROM order_slips')) return { rows: [] };
+        if (sql.includes('AS used_transaction')) {
+          return {
+            rows: orderTransactions.filter(item => item.transaction_id === values[0])
+          };
+        }
+        if (sql.includes('AS can_resubmit')) {
+          return { rows: previousSlipForUpload ? [previousSlipForUpload] : [] };
+        }
         if (sql.includes('FROM order_slips') && sql.includes("uploader_type = 'CUSTOMER'")) {
           return { rows: slips.length ? [{ id: slips.at(-1).id, status: slips.at(-1).status }] : [] };
         }
         if (sql.includes('INSERT INTO order_slips')) {
+          if (duplicateOnInsert) {
+            throw Object.assign(new Error('duplicate transaction reference'), {
+              code: '23505',
+              constraint: 'uq_order_slips_transaction_id'
+            });
+          }
+          if (insertError) throw insertError;
           slips.push({ id: slips.length + 1, status: values[6], transaction_id: values[9] });
+          return { rows: [{ id: slips.length }] };
         }
         if (sql.includes("SET status = 'MANUAL_REVIEW'")) slips.at(-1).status = 'MANUAL_REVIEW';
         return { rows: [] };
@@ -89,7 +111,10 @@ Module._load = function (request, parent, isMain) {
   if (request.endsWith('/services/slipOkService')) {
     return {
       getSlipOkConfigState: () => slipOkState,
-      verifySlipWithSlipOk: async () => slipOkResult
+      verifySlipWithSlipOk: async args => {
+        slipVerificationArgs = args;
+        return slipOkResult;
+      }
     };
   }
   if (request === 'firebase-admin/app') {
@@ -133,6 +158,11 @@ function reset() {
   deletedSlipLocations = [];
   slipOkState = 'not-configured';
   slipOkResult = undefined;
+  orderTransactions = [];
+  previousSlipForUpload = null;
+  slipVerificationArgs = undefined;
+  duplicateOnInsert = false;
+  insertError = null;
   orderDetailsResult = {
     id: 42,
     customer_order_status: 'รอชำระเงิน',
@@ -189,9 +219,147 @@ test('SlipOK approval marks the customer order paid and starts merchant preparat
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.status, 'VERIFIED');
   assert.equal(response.body.transactionId, 'SLIPOK-APPROVED-42');
+  assert.equal(slipVerificationArgs.paymentWindowStart, '2026-09-30T03:00:00.000Z');
+  assert.equal(slipVerificationArgs.paymentDeadline, '2026-09-30T03:05:00.000Z');
   assert.equal(slips[0].status, 'VERIFIED');
   assert.ok(calls.some(call => call.sql.includes("SET status = 'ชำระเงินแล้ว'")));
   assert.ok(calls.some(call => call.sql.includes("SET merchant_status = 'กำลังปรุง'")));
+});
+
+test('rejects a transaction ID already stored on an earlier order, including a cancelled order', async () => {
+  reset();
+  slipOkState = 'configured';
+  slipOkResult = {
+    verified: true,
+    manualReview: false,
+    detectedAmount: 25,
+    transactionId: 'REUSED-TRANSACTION-42',
+    ocrStatus: 'VERIFIED',
+    ocrText: '{"provider":"SlipOK"}',
+    reason: 'SlipOK ยืนยันสลิปแล้ว'
+  };
+  orderTransactions = [{
+    transaction_id: 'REUSED-TRANSACTION-42',
+    order_id: '41'
+  }];
+
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('reused-slip'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(response.body.code, 'DUPLICATE_SLIP');
+  assert.equal(notifications.length, 0);
+  assert.equal(slips.length, 0);
+  const duplicateLookup = calls.find(call => call.sql.includes('AS used_transaction'))?.sql || '';
+  assert.match(duplicateLookup, /FROM order_slips/);
+  assert.match(duplicateLookup, /FROM orders/);
+  assert.ok(!calls.some(call => call.sql.includes('UPDATE orders')));
+});
+
+test('returns a duplicate rejection if concurrent uploads hit the unique transaction index', async () => {
+  reset();
+  slipOkState = 'configured';
+  slipOkResult = {
+    verified: true,
+    manualReview: false,
+    detectedAmount: 25,
+    transactionId: 'RACE-TRANSACTION-42',
+    ocrStatus: 'VERIFIED',
+    ocrText: '{"provider":"SlipOK"}',
+    reason: 'SlipOK ยืนยันสลิปแล้ว'
+  };
+  duplicateOnInsert = true;
+
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('racing-slip'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(response.body.code, 'DUPLICATE_SLIP');
+  assert.equal(notifications.length, 0);
+  assert.ok(!calls.some(call => call.sql.includes('UPDATE orders')));
+});
+
+test('blocks a new slip after a failed submission until the merchant reports it', async () => {
+  reset();
+  slipOkState = 'configured';
+  slipOkResult = {
+    verified: false,
+    manualReview: false,
+    detectedAmount: 25,
+    transactionId: 'NEW-UNIQUE-FAILED-42',
+    ocrStatus: 'REJECTED',
+    ocrText: '{"provider":"SlipOK"}',
+    reason: 'เวลาสลิปไม่อยู่ในช่วงเวลาชำระ'
+  };
+  previousSlipForUpload = { status: 'REJECTED', can_resubmit: false };
+
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('new-slip'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.equal(response.body.code, 'WAITING_FOR_MERCHANT_REPORT');
+  assert.equal(slips.length, 0);
+  assert.equal(notifications.length, 0);
+  assert.ok(!calls.some(call => call.sql.includes('INSERT INTO order_slips')));
+});
+
+test('allows a new slip after the merchant reported the latest failed slip', async () => {
+  reset();
+  slipOkState = 'configured';
+  slipOkResult = {
+    verified: true,
+    manualReview: false,
+    detectedAmount: 25,
+    transactionId: 'NEW-UNIQUE-AFTER-REPORT-42',
+    ocrStatus: 'VERIFIED',
+    ocrText: '{"provider":"SlipOK"}',
+    reason: 'SlipOK ยืนยันยอดและบัญชีผู้รับแล้ว'
+  };
+  previousSlipForUpload = { status: 'REJECTED', can_resubmit: true };
+
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('replacement-slip'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.status, 'VERIFIED');
+  assert.equal(slips.length, 1);
+});
+
+test('returns a Thai customer message instead of exposing a database check-constraint error', async () => {
+  reset();
+  slipOkState = 'configured';
+  slipOkResult = {
+    verified: false,
+    manualReview: false,
+    detectedAmount: 25,
+    transactionId: 'CHECK-CONSTRAINT-42',
+    ocrStatus: 'REJECTED',
+    ocrText: '{"provider":"SlipOK"}',
+    reason: 'สลิปไม่ผ่านการตรวจสอบ'
+  };
+  insertError = Object.assign(
+    new Error('new row violates check constraint order_slips_status_chk'),
+    { code: '23514', constraint: 'order_slips_status_chk' }
+  );
+
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('check-constraint-slip'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 422);
+  assert.equal(response.body.code, 'SLIP_RECORD_FAILED');
+  assert.match(response.body.message, /ระบบบันทึกผลตรวจสลิปไม่สำเร็จ/);
+  assert.doesNotMatch(response.body.message, /constraint|order_slips/);
+  assert.ok(!calls.some(call => call.sql.includes('UPDATE orders')));
 });
 
 test('SlipOK rejection records rejected evidence without changing order status', async () => {
@@ -215,6 +383,9 @@ test('SlipOK rejection records rejected evidence without changing order status',
   assert.equal(response.statusCode, 422);
   assert.equal(response.body.status, 'REJECTED');
   assert.equal(slips[0].status, 'REJECTED');
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, 'ตรวจพบสลิปผิดปกติ');
+  assert.match(notifications[0].sourceId, /^42:slip:/);
   assert.ok(!calls.some(call => call.sql.includes('UPDATE orders')));
   assert.ok(!calls.some(call => call.sql.includes('UPDATE merchant_orders')));
 });
@@ -261,6 +432,8 @@ test('order detail exposes latest slip review without replacing order or merchan
   const orderQuery = calls.find(call => call.sql.includes('AS latest_slip_status'))?.sql || '';
   assert.match(orderQuery, /uploader_type = 'CUSTOMER'/);
   assert.match(orderQuery, /ORDER BY os\.created_at DESC, os\.id DESC/);
+  assert.match(orderQuery, /AS can_resubmit_slip/);
+  assert.match(orderQuery, /issue_type = 'SLIP_MISMATCH'/);
 });
 
 test('payment route is mounted before the orders catch-all route', () => {

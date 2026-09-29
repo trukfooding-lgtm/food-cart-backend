@@ -340,7 +340,7 @@ async function handlePostPaymentSlip(req, res) {
     await connection.query('BEGIN');
 
     const { rows: orders } = await connection.query(
-      `SELECT id, customer_id, merchant_id, total_price, status, payment_deadline
+      `SELECT id, customer_id, merchant_id, total_price, status, created_at, payment_deadline
        FROM orders
        WHERE id = $1
        FOR UPDATE`,
@@ -382,7 +382,9 @@ async function handlePostPaymentSlip(req, res) {
         expectedAmount,
         fileName: `slip.${getFileExtension(req.file)}`,
         contentType: req.file.mimetype,
-        merchant
+        merchant,
+        paymentWindowStart: order.created_at,
+        paymentDeadline: order.payment_deadline
       });
     } else if (slipOkConfig === 'incomplete') {
       verification = {
@@ -410,7 +412,18 @@ async function handlePostPaymentSlip(req, res) {
       `IMG_${crypto.createHash('sha256').update(req.file.buffer).digest('hex')}`;
 
     const { rows: duplicateSlips } = await connection.query(
-      'SELECT id, order_id FROM order_slips WHERE transaction_id = $1 LIMIT 1',
+      `SELECT used_transaction.order_id
+       FROM (
+         SELECT order_id::text AS order_id, created_at
+         FROM order_slips
+         WHERE transaction_id = $1
+         UNION ALL
+         SELECT id::text AS order_id, created_at
+         FROM orders
+         WHERE transaction_id = $1
+       ) AS used_transaction
+       ORDER BY created_at ASC
+       LIMIT 1`,
       [transactionId]
     );
     if (duplicateSlips.length > 0) {
@@ -419,6 +432,34 @@ async function handlePostPaymentSlip(req, res) {
         success: false,
         code: 'DUPLICATE_SLIP',
         message: `สลิปนี้ถูกใช้กับออเดอร์ #${duplicateSlips[0].order_id} แล้ว`
+      });
+    }
+
+    const { rows: previousSlips } = await connection.query(
+      `SELECT os.status,
+              EXISTS (
+                SELECT 1
+                FROM merchant_issue_reports slip_report
+                WHERE slip_report.merchant_id = $2
+                  AND slip_report.issue_type = 'SLIP_MISMATCH'
+                  AND slip_report.order_reference = $3
+                  AND slip_report.created_at >= os.created_at
+              ) AS can_resubmit
+       FROM order_slips os
+       WHERE os.order_id = $1
+         AND os.uploader_type = 'CUSTOMER'
+       ORDER BY os.created_at DESC, os.id DESC
+       LIMIT 1
+       FOR UPDATE OF os`,
+      [cleanOrderId, order.merchant_id, `ORD-${cleanOrderId}`]
+    );
+    const previousSlip = previousSlips[0];
+    if (previousSlip && previousSlip.can_resubmit !== true) {
+      await connection.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        code: 'WAITING_FOR_MERCHANT_REPORT',
+        message: 'ร้านได้รับแจ้งปัญหาสลิปแล้ว กรุณารอร้านรายงานก่อนแนบสลิปใหม่'
       });
     }
 
@@ -433,14 +474,15 @@ async function handlePostPaymentSlip(req, res) {
       ? 'VERIFIED'
       : verification.manualReview ? 'MANUAL_REVIEW' : 'REJECTED';
 
-    await connection.query(
+    const { rows: insertedSlips } = await connection.query(
       `INSERT INTO order_slips
         (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
          detected_amount, status, note, validation_reason, ocr_text,
          transaction_id, payment_channel, verified_at)
        VALUES
         ($1, 'CUSTOMER', $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11,
-         CASE WHEN $7 = 'VERIFIED' THEN NOW() ELSE NULL END)`,
+         CASE WHEN $7 = 'VERIFIED' THEN NOW() ELSE NULL END)
+       RETURNING id`,
       [
         cleanOrderId,
         order.customer_id,
@@ -455,6 +497,7 @@ async function handlePostPaymentSlip(req, res) {
         merchant.primaryChannel
       ]
     );
+    const slipId = insertedSlips[0]?.id;
 
     if (verification.manualReview) {
       await connection.query('COMMIT');
@@ -462,7 +505,7 @@ async function handlePostPaymentSlip(req, res) {
       await sendMerchantNotificationSafely({
         merchantId: order.merchant_id,
         sourceType: 'payment_issue',
-        sourceId: cleanOrderId,
+        sourceId: `${cleanOrderId}:slip:${slipId}`,
         title: 'มีสลิปรอตรวจสอบ',
         message: `ออเดอร์ #${cleanOrderId}: ${verification.reason}`,
         data: { order_id: cleanOrderId, payment_status: 'MANUAL_REVIEW' }
@@ -481,7 +524,7 @@ async function handlePostPaymentSlip(req, res) {
       await sendMerchantNotificationSafely({
         merchantId: order.merchant_id,
         sourceType: 'payment_issue',
-        sourceId: cleanOrderId,
+        sourceId: `${cleanOrderId}:slip:${slipId}`,
         title: 'ตรวจพบสลิปผิดปกติ',
         message: `ออเดอร์ #${cleanOrderId}: ${verification.reason}`,
         data: { order_id: cleanOrderId, payment_status: 'REJECTED' }
@@ -544,10 +587,22 @@ async function handlePostPaymentSlip(req, res) {
       });
     }
     console.error('❌ [Payment Verification Failed]: ' + error.message);
-    return res.status(400).json({
-      success: false,
-      message: error.message
-    });
+    if (error?.code === '23505' &&
+        error?.constraint === 'uq_order_slips_transaction_id') {
+      return res.status(422).json({
+        success: false,
+        code: 'DUPLICATE_SLIP',
+        message: 'สลิปนี้ถูกใช้ชำระคำสั่งซื้อแล้ว'
+      });
+    }
+    if (error?.code === '23514') {
+      return res.status(422).json({
+        success: false,
+        code: 'SLIP_RECORD_FAILED',
+        message: 'ระบบบันทึกผลตรวจสลิปไม่สำเร็จ กรุณาลองใหม่อีกครั้ง หากยังไม่สำเร็จให้ติดต่อร้านค้า'
+      });
+    }
+    return res.status(400).json({ success: false, message: error.message });
   } finally {
     connection?.release();
   }
@@ -911,11 +966,11 @@ router.post('/merchants/:merchantId/orders/:orderId/payment-slip/report', async 
 
     const slip = rows[0];
     const slipStatus = String(slip.slip_status || '').toUpperCase();
-    if (slipStatus !== 'REJECTED' && slipStatus !== 'VERIFIED') {
+    if (!['REJECTED', 'UNREADABLE', 'MANUAL_REVIEW', 'VERIFIED'].includes(slipStatus)) {
       return res.status(404).json({ success: false, message: 'ไม่พบสลิปที่สามารถรายงานได้' });
     }
 
-    if (slipStatus === 'REJECTED') {
+    if (slipStatus !== 'VERIFIED') {
       const reason = slip.validation_reason || 'ระบบตรวจพบสลิปผิดปกติ';
       await pool.query(
         `INSERT INTO merchant_issue_reports
