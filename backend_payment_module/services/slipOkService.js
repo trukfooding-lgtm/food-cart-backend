@@ -50,6 +50,7 @@ function serializeSlipEvidence(data, amount) {
     transRef: data?.transRef || null,
     transDate: data?.transDate || null,
     transTime: data?.transTime || null,
+    transTimestamp: data?.transTimestamp || null,
     receiverName: data?.receiver?.displayName || data?.receiver?.name || null,
     receiverAccount: data?.receiver?.account?.value || null,
     receiverProxy: data?.receiver?.proxy?.value || null
@@ -70,6 +71,71 @@ function resultForUnavailable(reason, providerData = null) {
   };
 }
 
+function validateSlipTransactionTime(data, {
+  paymentWindowStart,
+  paymentDeadline,
+  now = new Date()
+} = {}) {
+  const timestamp = data?.transTimestamp;
+  const transactionTime = typeof timestamp === 'string' ? new Date(timestamp) : null;
+  const windowStart = paymentWindowStart ? new Date(paymentWindowStart) : null;
+  const windowEnd = paymentDeadline ? new Date(paymentDeadline) : null;
+  const checkedAt = new Date(now);
+
+  if (!transactionTime || !Number.isFinite(transactionTime.getTime()) ||
+      !windowStart || !Number.isFinite(windowStart.getTime())) {
+    return {
+      valid: false,
+      manualReview: true,
+      reason: 'ข้อมูลเวลาโอนหรือเวลาสร้างออเดอร์ไม่ครบ กรุณาให้ร้านตรวจสอบ'
+    };
+  }
+
+  if (paymentDeadline && !Number.isFinite(windowEnd.getTime())) {
+    return {
+      valid: false,
+      manualReview: true,
+      reason: 'ข้อมูลกำหนดเวลาชำระเงินไม่ถูกต้อง กรุณาให้ร้านตรวจสอบ'
+    };
+  }
+
+  if (!Number.isFinite(checkedAt.getTime())) {
+    return {
+      valid: false,
+      manualReview: true,
+      reason: 'ระบบอ่านเวลาปัจจุบันไม่ได้ กรุณาให้ร้านตรวจสอบ'
+    };
+  }
+
+  if (transactionTime < windowStart) {
+    return {
+      valid: false,
+      manualReview: false,
+      reason: 'เวลาที่โอนในสลิปเกิดก่อนสร้างคำสั่งซื้อนี้'
+    };
+  }
+
+  if (windowEnd && transactionTime > windowEnd) {
+    return {
+      valid: false,
+      manualReview: false,
+      reason: 'เวลาที่โอนในสลิปเกินกำหนดชำระของคำสั่งซื้อนี้'
+    };
+  }
+
+  // SlipOK returns the bank transaction timestamp in UTC. Allow a small
+  // clock skew but never accept a timestamp materially in the future.
+  if (transactionTime.getTime() > checkedAt.getTime() + 60_000) {
+    return {
+      valid: false,
+      manualReview: false,
+      reason: 'เวลาโอนในสลิปอยู่ในอนาคต ไม่สามารถยืนยันการชำระเงินได้'
+    };
+  }
+
+  return { valid: true, manualReview: false, reason: null };
+}
+
 async function fetchJsonWithTimeout(fetchImpl, url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -87,6 +153,9 @@ async function verifySlipWithSlipOk({
   fileName,
   contentType,
   merchant,
+  paymentWindowStart,
+  paymentDeadline,
+  now = new Date(),
   env = process.env,
   fetchImpl = globalThis.fetch
 }) {
@@ -182,6 +251,23 @@ async function verifySlipWithSlipOk({
     };
   }
 
+  const timeValidation = validateSlipTransactionTime(data, {
+    paymentWindowStart,
+    paymentDeadline,
+    now
+  });
+  if (!timeValidation.valid) {
+    return {
+      verified: false,
+      manualReview: timeValidation.manualReview,
+      detectedAmount,
+      transactionId,
+      ocrStatus: timeValidation.manualReview ? 'MANUAL_REVIEW' : 'REJECTED',
+      ocrText: evidence,
+      reason: timeValidation.reason
+    };
+  }
+
   const recipient = receiverMatch(data.receiver, merchant);
   if (recipient !== true) {
     return {
@@ -210,5 +296,6 @@ async function verifySlipWithSlipOk({
 
 module.exports = {
   getSlipOkConfigState,
-  verifySlipWithSlipOk
+  verifySlipWithSlipOk,
+  validateSlipTransactionTime
 };
