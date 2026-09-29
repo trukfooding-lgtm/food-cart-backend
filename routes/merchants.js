@@ -1401,7 +1401,11 @@ router.get(
           `SELECT
              id,
              source_type,
-             source_id,
+             CASE
+               WHEN source_type = 'payment_issue' AND source_id LIKE '%:slip:%'
+               THEN split_part(source_id, ':slip:', 1)
+               ELSE source_id
+             END AS source_id,
              title,
              message,
              event_at
