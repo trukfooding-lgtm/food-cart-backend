@@ -317,6 +317,7 @@ async function handleGetPaymentInfo(req, res) {
 async function handlePostPaymentSlip(req, res) {
   let connection;
   let savedSlipLocation = null;
+  let transactionCommitted = false;
   try {
     const { orderId } = req.params;
     const cleanOrderId = orderId.toString().replace(/[^0-9]/g, '');
@@ -457,7 +458,8 @@ async function handlePostPaymentSlip(req, res) {
 
     if (verification.manualReview) {
       await connection.query('COMMIT');
-      await sendMerchantNotification({
+      transactionCommitted = true;
+      await sendMerchantNotificationSafely({
         merchantId: order.merchant_id,
         sourceType: 'payment_issue',
         sourceId: cleanOrderId,
@@ -475,7 +477,8 @@ async function handlePostPaymentSlip(req, res) {
 
     if (!verification.verified) {
       await connection.query('COMMIT');
-      await sendMerchantNotification({
+      transactionCommitted = true;
+      await sendMerchantNotificationSafely({
         merchantId: order.merchant_id,
         sourceType: 'payment_issue',
         sourceId: cleanOrderId,
@@ -508,8 +511,9 @@ async function handlePostPaymentSlip(req, res) {
       [cleanOrderId, order.merchant_id]
     );
     await connection.query('COMMIT');
+    transactionCommitted = true;
 
-    await sendMerchantNotification({
+    await sendMerchantNotificationSafely({
       merchantId: order.merchant_id,
       sourceType: 'payment_verified',
       sourceId: cleanOrderId,
@@ -529,8 +533,12 @@ async function handlePostPaymentSlip(req, res) {
     });
 
   } catch (error) {
-    if (connection) await connection.query('ROLLBACK');
-    if (savedSlipLocation) {
+    if (connection && !transactionCommitted) {
+      await connection.query('ROLLBACK').catch(rollbackError => {
+        console.warn('Payment slip rollback failed:', rollbackError.message);
+      });
+    }
+    if (savedSlipLocation && !transactionCommitted) {
       await deletePaymentSlip(savedSlipLocation).catch(cleanupError => {
         console.warn('Payment slip cleanup failed:', cleanupError.message);
       });
@@ -542,6 +550,15 @@ async function handlePostPaymentSlip(req, res) {
     });
   } finally {
     connection?.release();
+  }
+}
+
+async function sendMerchantNotificationSafely(notification) {
+  try {
+    await sendMerchantNotification(notification);
+  } catch (error) {
+    // Notification failure must not undo a committed payment slip or delete its proof.
+    console.warn('Payment slip merchant notification failed:', error.message);
   }
 }
 
