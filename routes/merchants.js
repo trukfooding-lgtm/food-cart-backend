@@ -1947,6 +1947,8 @@ router.put(
            SET
              merchant_status = $1,
 
+             updated_at = NOW(),
+
              prep_minutes =
                COALESCE(
                  $2,
