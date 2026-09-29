@@ -8,6 +8,8 @@ let calls = [];
 let notifications = [];
 let slipOkState = 'not-configured';
 let slipOkResult;
+let failMerchantNotification = false;
+let deletedSlipLocations = [];
 let orderDetailsResult = {
   id: 42,
   customer_order_status: 'รอชำระเงิน',
@@ -54,13 +56,18 @@ require.cache[storagePath] = {
     SlipStorageError: class SlipStorageError extends Error {},
     uploadPaymentSlip: async ({ orderId, fileName }) => `storage://payment-slips/${orderId}/${fileName}`,
     getPaymentSlipUrl: async location => location,
-    deletePaymentSlip: async () => {}
+    deletePaymentSlip: async location => deletedSlipLocations.push(location)
   }
 };
 const notificationPath = require.resolve('../services/merchant_push_notification');
 require.cache[notificationPath] = {
   id: notificationPath, filename: notificationPath, loaded: true,
-  exports: { sendMerchantNotification: async item => notifications.push(item) }
+  exports: {
+    sendMerchantNotification: async item => {
+      if (failMerchantNotification) throw new Error('push provider unavailable');
+      notifications.push(item);
+    }
+  }
 };
 
 const layers = [];
@@ -122,6 +129,8 @@ function reset() {
   orderCustomerId = 17;
   calls = [];
   notifications = [];
+  failMerchantNotification = false;
+  deletedSlipLocations = [];
   slipOkState = 'not-configured';
   slipOkResult = undefined;
   orderDetailsResult = {
@@ -142,6 +151,21 @@ test('SlipOK unavailable saves evidence for merchant review and never marks orde
   assert.equal(slips[0].status, 'MANUAL_REVIEW');
   assert.ok(!calls.some(call => call.sql.includes("SET status = 'ชำระเงินแล้ว'")));
   assert.ok(!calls.some(call => call.sql.includes('UPDATE orders')));
+});
+
+test('merchant notification failure does not delete a committed manual-review slip', async () => {
+  reset();
+  failMerchantNotification = true;
+  const response = await invoke(handlerFor('/orders/:orderId/payment-slip'), {
+    params: { orderId: '42' }, body: {},
+    file: { buffer: Buffer.from('slip-proof'), mimetype: 'image/jpeg' }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.status, 'MANUAL_REVIEW');
+  assert.equal(slips[0].status, 'MANUAL_REVIEW');
+  assert.equal(deletedSlipLocations.length, 0);
+  assert.ok(calls.some(call => call.sql === 'COMMIT'));
 });
 
 test('SlipOK approval marks the customer order paid and starts merchant preparation', async () => {
