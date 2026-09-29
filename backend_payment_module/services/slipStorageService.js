@@ -9,10 +9,10 @@ class SlipStorageError extends Error {
   }
 }
 
-function getConfig() {
-  const baseUrl = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
-  const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '');
-  const bucket = String(process.env.SLIP_STORAGE_BUCKET || DEFAULT_BUCKET);
+function getConfig(env = process.env) {
+  const baseUrl = String(env.SUPABASE_URL || '').replace(/\/$/, '');
+  const serviceRoleKey = String(env.SUPABASE_SERVICE_ROLE_KEY || '');
+  const bucket = String(env.SLIP_STORAGE_BUCKET || DEFAULT_BUCKET);
 
   if (!baseUrl || !serviceRoleKey) {
     throw new SlipStorageError(
@@ -69,15 +69,26 @@ async function uploadPaymentSlip({ orderId, fileName, buffer, contentType }) {
   return `storage://${config.bucket}/${objectPath}`;
 }
 
-async function getPaymentSlipUrl(location) {
+function resolveSignedUrl(signedUrl, baseUrl) {
+  if (/^https?:\/\//i.test(signedUrl)) return signedUrl;
+  if (signedUrl.startsWith('/object/')) {
+    return `${baseUrl}/storage/v1${signedUrl}`;
+  }
+  if (signedUrl.startsWith('/storage/v1/')) {
+    return `${baseUrl}${signedUrl}`;
+  }
+  return new URL(signedUrl, `${baseUrl}/storage/v1/`).toString();
+}
+
+async function getPaymentSlipUrl(location, { env, fetchImpl } = {}) {
   const parsed = parseLocation(location);
   if (!parsed) return location;
 
-  const config = getConfig();
+  const config = getConfig(env);
   if (parsed.bucket !== config.bucket) {
     throw new SlipStorageError('ไม่อนุญาตให้อ่านสลิปจาก bucket อื่น');
   }
-  const response = await fetch(
+  const response = await (fetchImpl || fetch)(
     `${config.baseUrl}/storage/v1/object/sign/${encodeURIComponent(parsed.bucket)}/${encodeObjectPath(parsed.objectPath)}`,
     {
       method: 'POST',
@@ -91,7 +102,7 @@ async function getPaymentSlipUrl(location) {
   const result = await response.json();
   const signedUrl = result.signedURL || result.signedUrl;
   if (!signedUrl) throw new SlipStorageError('Storage ไม่ส่งลิงก์สลิปกลับมา');
-  return new URL(signedUrl, config.baseUrl).toString();
+  return resolveSignedUrl(signedUrl, config.baseUrl);
 }
 
 async function deletePaymentSlip(location) {

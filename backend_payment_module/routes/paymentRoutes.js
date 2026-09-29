@@ -654,7 +654,9 @@ router.get('/merchants/:merchantId/orders/:orderId/payment-slip', async (req, re
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'ไม่พบหลักฐานการชำระเงิน' });
     }
-    return res.json({ success: true, data: rows[0] });
+    const slip = { ...rows[0] };
+    slip.slip_url = await getPaymentSlipUrl(slip.slip_url);
+    return res.json({ success: true, data: slip });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
