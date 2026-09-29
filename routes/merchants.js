@@ -7,6 +7,7 @@ const {
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
 const { getActiveSuspension } = require('../services/account_status');
 const { normalizeMenuImageFields, normalizeUploadImageUrl } = require('../services/menuImageUrlService');
+const { getPickupReadyNotificationBody } = require('../services/pickupReadyNotification');
 installMerchantMap(router);
 
 function toPositiveInt(value, fallback = 0) {
@@ -2031,19 +2032,26 @@ router.put(
             'ไม่พบออเดอร์ฝั่งลูกค้า'
         });
       }
+      let pickupReadyNotificationBody;
       if (
         status === 'รอรับสินค้า' &&
         customerOrder.merchant_status !== 'รอรับสินค้า'
       ) {
-  await connection.query(
-    `INSERT INTO notifications (user_id, title, body)
-     VALUES ($1, $2, $3)`,
-    [
-      customerOrder.customer_id,
-      'ออเดอร์พร้อมรับแล้ว',
-      `ออเดอร์ #${req.params.orderId} ทางร้านอัปเดตเป็นพร้อมรับ สามารถไปรับอาหารได้เลย`
-    ]
-  );
+        pickupReadyNotificationBody = await getPickupReadyNotificationBody(
+          connection,
+          req.params.id,
+          req.params.orderId
+        );
+
+        await connection.query(
+          `INSERT INTO notifications (user_id, title, body)
+           VALUES ($1, $2, $3)`,
+          [
+            customerOrder.customer_id,
+            'ออเดอร์พร้อมรับแล้ว',
+            pickupReadyNotificationBody
+          ]
+        );
 }
       if (status === 'ยกเลิก') {
         await refundOrderPointsOnce(connection, req.params.orderId);
@@ -2053,13 +2061,13 @@ router.put(
       if (
         status === 'รอรับสินค้า' &&
         customerOrder.merchant_status !== 'รอรับสินค้า'
-    ) {
-  await sendCustomerPushNotifications(
-    customerOrder.customer_id,
-    'ออเดอร์พร้อมรับแล้ว',
-    `ออเดอร์ #${req.params.orderId} ทางร้านอัปเดตเป็นพร้อมรับ สามารถไปรับอาหารได้เลย`
-  );
-}
+      ) {
+        await sendCustomerPushNotifications(
+          customerOrder.customer_id,
+          'ออเดอร์พร้อมรับแล้ว',
+          pickupReadyNotificationBody
+        );
+      }
       res.json({
         success: true,
         merchant_status: status,
