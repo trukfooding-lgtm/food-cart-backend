@@ -3,7 +3,6 @@ const router = express.Router();
 const { pool } = require('../config/db');
 const { sendMerchantNotification } = require('../services/merchant_push_notification');
 const { uploadMenuImage } = require('../services/menuImageStorageService');
-const { getActiveSuspension } = require('../services/account_status');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -232,16 +231,6 @@ router.post('/create', async (req, res) => {
  let connection;
 
  try {
- const suspension = await getActiveSuspension('customer', Number(customer_id));
- if (suspension) {
- return res.status(403).json({
- success: false,
- code: 'ACCOUNT_SUSPENDED',
- message: `บัญชีถูกระงับเนื่องจาก: ${suspension.reason}`,
- reason: suspension.reason,
- });
- }
-
  connection = await pool.connect();
  await connection.query('BEGIN');
 
@@ -589,33 +578,12 @@ router.get('/:id', async (req, res) => {
   `SELECT
   o.*,
   o.status AS customer_order_status,
-  (
-   SELECT os.status
+  (SELECT os.status
    FROM order_slips os
    WHERE os.order_id = o.id::text
      AND os.uploader_type = 'CUSTOMER'
    ORDER BY os.created_at DESC, os.id DESC
-   LIMIT 1
-  ) AS latest_slip_status,
-  COALESCE((
-   SELECT CASE
-    WHEN latest_customer_slip.status IN ('REJECTED', 'UNREADABLE', 'MANUAL_REVIEW')
-    THEN EXISTS (
-     SELECT 1
-     FROM merchant_issue_reports slip_report
-     WHERE slip_report.merchant_id = o.merchant_id
-       AND slip_report.issue_type = 'SLIP_MISMATCH'
-       AND slip_report.order_reference = 'ORD-' || o.id::text
-       AND slip_report.created_at >= latest_customer_slip.created_at
-    )
-    ELSE FALSE
-   END
-   FROM order_slips latest_customer_slip
-   WHERE latest_customer_slip.order_id = o.id::text
-     AND latest_customer_slip.uploader_type = 'CUSTOMER'
-   ORDER BY latest_customer_slip.created_at DESC, latest_customer_slip.id DESC
-   LIMIT 1
-  ), FALSE) AS can_resubmit_slip,
+   LIMIT 1) AS latest_slip_status,
   mo.merchant_status,
  mo.prep_minutes,
  mo.reject_reason,
@@ -1086,6 +1054,72 @@ router.get(
 );
 
 // ==========================================================
+// 8.1 DELETE /api/orders/notifications/customer/:customerId
+// ลบการแจ้งเตือนทั้งหมดของลูกค้าในตาราง notifications
+// ==========================================================
+router.delete(
+  '/notifications/customer/:customerId',
+  async (req, res) => {
+    const customerId = req.params.customerId;
+
+    try {
+      const outcome = await pool.query(
+        'DELETE FROM notifications WHERE user_id = $1',
+        [customerId]
+      );
+
+      return res.json({
+        success: true,
+        deletedCount: outcome.rowCount || 0,
+      });
+    } catch (error) {
+      console.error('Error clearing customer notifications:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Server Error',
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==========================================================
+// 8.2 DELETE /api/orders/notifications/:id
+// ลบการแจ้งเตือนรายการเดียวในตาราง notifications
+// ==========================================================
+router.delete(
+  '/notifications/:id',
+  async (req, res) => {
+    const notificationId = req.params.id;
+    const customerId = req.query.customerId;
+
+    try {
+      let queryText = 'DELETE FROM notifications WHERE id = $1';
+      const queryParams = [notificationId];
+
+      if (customerId) {
+        queryText += ' AND user_id = $2';
+        queryParams.push(customerId);
+      }
+
+      const outcome = await pool.query(queryText, queryParams);
+
+      return res.json({
+        success: true,
+        deletedCount: outcome.rowCount || 0,
+      });
+    } catch (error) {
+      console.error('Error deleting notification:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Server Error',
+        error: error.message,
+      });
+    }
+  }
+);
+
+// ==========================================================
 // 9. PUT /api/orders/:id/status
 // ==========================================================
 router.put(
@@ -1204,80 +1238,8 @@ function parsedFloatOrNull(value) {
  return Number.isFinite(parsed) ? parsed : null;
 }
 
-// เก็บหลักฐานสลิปไว้ให้ร้านค้าเปิดตรวจสอบย้อนหลังได้
-// โดยไม่ลบหลักฐานเดิม และไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้วเอง
-async function insertSlipRecord({
- orderId,
- customerId,
- slipUrl,
- expectedAmount,
- detectedAmount,
- status,
- reason,
- ocrText,
- transactionId,
- verifiedAt = null,
- throwOnError = false,
-}) {
- const fallbackSlipId = `${status}_${orderId}_${Date.now()}`;
-
- try {
-   const { rows: insertedSlipRows } = await pool.query(
-     `INSERT INTO order_slips
-       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
-        detected_amount, status, note, validation_reason, ocr_text,
-        transaction_id, payment_channel, verified_at)
-      VALUES
-       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, $7, $8, $8, $9,
-        $10, NULL, $11)
-       RETURNING id`,
-     [
-       String(orderId),
-       customerId,
-       slipUrl,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       Number.isFinite(expectedAmount) ? expectedAmount : null,
-       Number.isFinite(detectedAmount) ? detectedAmount : null,
-       status,
-       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
-       String(ocrText || '').slice(0, 8000),
-       transactionId || `${status}_${orderId}_${Date.now()}`,
-       verifiedAt,
-     ],
-   );
-
-   return insertedSlipRows[0]?.id != null
-     ? String(insertedSlipRows[0].id)
-     : fallbackSlipId;
- } catch (error) {
-   if (throwOnError) throw error;
-   // การบันทึกหลักฐานสลิปผิดปกติต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
-   console.warn('Slip record warning:', error.message);
-   return fallbackSlipId;
- }
-}
-
-// ทำให้ออร์เดอร์ฝั่งร้านเข้าสู่รายการตรวจสอบเมื่อมีสลิปส่งเข้ามาแล้ว
-// โดยไม่เปลี่ยนสถานะหรือข้อมูลออร์เดอร์ฝั่งลูกค้า
-async function markMerchantOrderForSlipReview({ orderId, merchantId }) {
- if (merchantId == null) return;
-
- try {
-   await pool.query(
-     `UPDATE merchant_orders
-      SET merchant_status = 'รอตรวจสอบ', updated_at = NOW()
-      WHERE source_order_id = $1
-        AND merchant_id = $2
-        AND merchant_status IN ('ใหม่', 'รอชำระเงิน')`,
-     [orderId, merchantId],
-   );
- } catch (error) {
-   console.warn('Merchant slip review status warning:', error.message);
- }
-}
-
 // เก็บสลิปที่ตรวจไม่ผ่านไว้ให้ร้านค้าเปิดตรวจสอบและรายงานได้
-// โดยคงพฤติกรรมแจ้งเตือนร้านเดิมไว้
+// โดยไม่เปลี่ยนสถานะออเดอร์เป็นชำระเงินแล้ว
 async function recordRejectedSlip({
  orderId,
  customerId,
@@ -1287,32 +1249,53 @@ async function recordRejectedSlip({
  detectedAmount,
  reason,
  ocrText,
-}) {
- const slipNotificationId = await insertSlipRecord({
-   orderId,
-   customerId,
-   slipUrl,
-   expectedAmount,
-   detectedAmount,
-   status: 'REJECTED',
-   reason,
-   ocrText,
-   transactionId: `REJECTED_${orderId}_${Date.now()}`,
- });
+ isManualReview = false,
+ }) {
+ let slipNotificationId = `attempt-${Date.now()}`;
 
- await markMerchantOrderForSlipReview({ orderId, merchantId });
+ try {
+   const { rows: insertedSlipRows } = await pool.query(
+     `INSERT INTO order_slips
+       (order_id, uploader_type, uploader_id, slip_url, amount, expected_amount,
+        detected_amount, status, note, validation_reason, ocr_text,
+        transaction_id, payment_channel, verified_at)
+      VALUES
+       ($1, 'CUSTOMER', $2, $3, $4, $5, $6, $7, $8, $8, $9,
+        $10, NULL, NULL)
+       RETURNING id`,
+     [
+       String(orderId),
+       customerId,
+       slipUrl,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       Number.isFinite(expectedAmount) ? expectedAmount : null,
+       Number.isFinite(detectedAmount) ? detectedAmount : null,
+       isManualReview ? 'UNREADABLE' : 'REJECTED',
+       String(reason || 'ระบบตรวจพบสลิปผิดปกติ').slice(0, 2000),
+       String(ocrText || '').slice(0, 8000),
+       `${isManualReview ? 'REVIEW' : 'REJECTED'}_${orderId}_${Date.now()}`,
+     ],
+   );
+
+   if (insertedSlipRows[0]?.id != null) {
+     slipNotificationId = String(insertedSlipRows[0].id);
+   }
+ } catch (error) {
+   // การบันทึกหลักฐานต้องไม่ทำให้การตอบกลับสถานะสลิปล้มเหลว
+   console.warn('Rejected slip record warning:', error.message);
+ }
 
  try {
    await sendMerchantNotification({
      merchantId,
-     sourceType: 'payment_slip_rejected',
+     sourceType: isManualReview ? 'payment_slip_review' : 'payment_slip_rejected',
      sourceId: `${orderId}:${slipNotificationId}`,
-     title: 'ตรวจพบสลิปผิดปกติ',
+     title: isManualReview ? 'มีสลิปรอตรวจสอบ' : 'ตรวจพบสลิปผิดปกติ',
      message: `ออเดอร์ #${orderId}: ${String(reason || 'ระบบตรวจพบสลิปผิดปกติ')}`,
      data: {
        order_id: orderId,
        slip_id: slipNotificationId,
-       payment_status: 'REJECTED',
+       payment_status: isManualReview ? 'MANUAL_REVIEW' : 'REJECTED',
      },
    });
  } catch (error) {
@@ -1416,8 +1399,8 @@ router.post(
       }
 
       // Layer 4: ตรวจสอบสถานะการคัดกรองเบื้องต้น
-      if (normalizedOcrStatus === 'REJECTED') {
-        const reason = 'สลิปไม่ผ่านการตรวจสอบความถูกต้องของระบบธนาคาร';
+      const isClientOcrRejected = normalizedOcrStatus === 'REJECTED';
+      if (isClientOcrRejected) {
         await recordRejectedSlip({
           orderId,
           customerId,
@@ -1425,13 +1408,9 @@ router.post(
           slipUrl,
           expectedAmount: dbOrderTotal,
           detectedAmount: parsedDetectedAmount,
-          reason,
+          reason: 'ระบบอ่านรายละเอียดธนาคารจากภาพไม่ชัดเจน กรุณาให้ร้านตรวจสอบสลิป',
           ocrText,
-        });
-        return res.status(400).json({
-          success: false,
-          status: 'REJECTED',
-          message: reason,
+          isManualReview: true,
         });
       }
 
@@ -1477,27 +1456,10 @@ router.post(
       if (
         normalizedOcrStatus === 'MANUAL_REVIEW' ||
         isUnreadableSlip ||
+        isClientOcrRejected ||
         !normTxId
       ) {
         await updateOrderStatusSafely('รอตรวจสอบการชำระเงิน');
-        await markMerchantOrderForSlipReview({ orderId, merchantId: mId });
-
-        // กรณีที่ยังไม่ผ่านการตรวจสอบอัตโนมัติ ต้องเก็บสลิปไว้ให้ร้านค้า
-        // เปิดดูและตัดสินใจได้ โดยไม่เรียกแจ้งเตือนซ้ำกับกรณี UNREADABLE
-        let reviewSlipId;
-        if (!isUnreadableSlip) {
-          reviewSlipId = await insertSlipRecord({
-            orderId,
-            customerId,
-            slipUrl,
-            expectedAmount: dbOrderTotal,
-            detectedAmount: parsedDetectedAmount,
-            status: 'REJECTED',
-            reason: 'สลิปยังไม่ผ่านการตรวจสอบอัตโนมัติ กรุณาให้ร้านค้าตรวจสอบ',
-            ocrText,
-            transactionId: `REJECTED_${orderId}_${Date.now()}`,
-          });
-        }
 
         await sendPushNotification(
           customerId,
@@ -1505,19 +1467,18 @@ router.post(
           `ออเดอร์ #${orderId} ร้านค้ากำลังตรวจสอบหลักฐานการชำระเงินของคุณ`
         );
 
-        if (!isUnreadableSlip && typeof sendMerchantNotification === 'function') {
+        if (
+          !isUnreadableSlip &&
+          !isClientOcrRejected &&
+          typeof sendMerchantNotification === 'function'
+        ) {
           try {
             await sendMerchantNotification({
               merchantId: mId,
               sourceType: 'payment_slip_review',
-              sourceId: `${orderId}:${reviewSlipId || 'latest'}`,
+              sourceId: orderId,
               title: 'มีสลิปรอตรวจสอบ',
               message: `ออเดอร์ #${orderId} ลูกค้าแนบสลิปแล้ว กรุณาตรวจสอบยอดเงิน ฿${dbOrderTotal.toFixed(2)}`,
-              data: {
-                order_id: orderId,
-                slip_id: reviewSlipId,
-                payment_status: 'REJECTED',
-              },
             });
           } catch (e) {
             console.warn('Merchant notification warning:', e.message);
@@ -1532,30 +1493,14 @@ router.post(
       }
 
       // Layer 6: เมื่อผ่านครบทุกชั้นอย่างสมบูรณ์ (VERIFIED)
-      // บันทึกสลิปก่อนเปลี่ยนสถานะออเดอร์ เพื่อให้ร้านเปิดดูย้อนหลัง
-      // และรายงานได้ แม้ระบบจะตรวจผ่านอัตโนมัติแล้ว
-      await insertSlipRecord({
-        orderId,
-        customerId,
-        slipUrl,
-        expectedAmount: dbOrderTotal,
-        detectedAmount: parsedDetectedAmount,
-        status: 'VERIFIED',
-        reason: 'ระบบตรวจสอบสลิปผ่านแล้ว',
-        ocrText,
-        transactionId: transactionId || `VERIFIED_${orderId}_${Date.now()}`,
-        verifiedAt: new Date(),
-        throwOnError: true,
-      });
       usedSlipTransactions.add(normTxId);
       await updateOrderStatusSafely('ชำระเงินแล้ว');
       await pool.query(
         `UPDATE merchant_orders
-         SET merchant_status = 'กำลังปรุง',
+         SET merchant_status = 'ชำระเงินแล้ว',
              updated_at = NOW()
          WHERE source_order_id = $1
-           AND merchant_id = $2
-           AND merchant_status IN ('รอชำระเงิน', 'ชำระเงินแล้ว')`,
+           AND merchant_id = $2`,
         [orderId, mId]
       );
 
