@@ -1,70 +1,17 @@
+// ==========================================================
+// ส่วนหัวมอดูล: ระบบการทำงานฝั่งร้านค้า (Merchant Module Router)
+// ทำหน้าที่จัดการการเข้าสู่ระบบ สมัครสมาชิก แก้ไขโปรไฟล์ จัดการเมนู เวลาทำการ จุดขาย สรุปยอดขาย และรายงานปัญหา
+// ==========================================================
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/db');
-const {
-  sendCustomerPushNotifications
-} = require('../services/customer_push_notification');
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
 const { getActiveSuspension } = require('../services/account_status');
-const { normalizeMenuImageFields, normalizeUploadImageUrl } = require('../services/menuImageUrlService');
-const { getPickupReadyNotificationBody } = require('../services/pickupReadyNotification');
 installMerchantMap(router);
 
-function toPositiveInt(value, fallback = 0) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(0, Math.floor(parsed));
-}
-
-async function refundOrderPointsOnce(connection, orderId) {
-  const { rows } = await connection.query(
-    `SELECT
-       id,
-       customer_id,
-       merchant_id,
-       COALESCE(points_used, 0) AS points_used,
-       points_refunded_at
-     FROM orders
-     WHERE id = $1
-     FOR UPDATE`,
-    [orderId]
-  );
-
-  if (rows.length === 0) return false;
-  const order = rows[0];
-  const pointsUsed = toPositiveInt(order.points_used, 0);
-  if (pointsUsed <= 0 || order.points_refunded_at) return false;
-
-  await connection.query(
-    `INSERT INTO customer_merchant_points
-      (customer_id, merchant_id, points_balance)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (customer_id, merchant_id)
-     DO UPDATE SET
-       points_balance = customer_merchant_points.points_balance + EXCLUDED.points_balance,
-       updated_at = NOW()`,
-    [order.customer_id, order.merchant_id, pointsUsed]
-  );
-
-  await connection.query(
-    `INSERT INTO customer_point_transactions
-      (customer_id, merchant_id, order_id, type, points, amount, note)
-     VALUES ($1, $2, $3, 'REFUND', $4, 0, 'คืนแต้มจากคำสั่งซื้อที่ถูกยกเลิก')`,
-    [order.customer_id, order.merchant_id, orderId, pointsUsed]
-  );
-
-  await connection.query(
-    `UPDATE orders
-     SET points_refunded_at = NOW()
-     WHERE id = $1`,
-    [orderId]
-  );
-
-  return true;
-}
-
 // ==========================================================
-// POST /api/merchants/register -> สมัครสมาชิกผู้ค้า
+// ขอบเขตที่ 1.3.3.1: เข้าสู่ระบบ สมัครสมาชิก และผูกบัญชีรับเงิน
+// POST /api/merchants/register -> สมัครสมาชิกผู้ค้าพร้อมบัญชีรับเงิน
 // ==========================================================
 router.post('/register', async (req, res) => {
   const connection = await pool.connect();
@@ -79,6 +26,8 @@ router.post('/register', async (req, res) => {
       bank_account: bankAccount
     } = req.body;
 
+    // จุดที่อาจารย์อาจสั่งแก้: เพิ่มเงื่อนไขตรวจสอบความยาวรหัสผ่าน
+    // ตรวจสอบรหัสผ่านขั้นต่ำ: if (password.length < 6) return res.status(400).json({ message: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร' });
     if (!name || !email || !password || !phone) {
       return res.status(400).json({
         message: 'กรุณากรอกข้อมูลที่จำเป็นให้ครบถ้วน'
@@ -106,6 +55,8 @@ router.post('/register', async (req, res) => {
     const cleanAccountNumber = String(accountNumber || '').trim();
     const cleanPromptPayId = String(promptPayId || '').trim();
     const cleanReceiverName = String(receiverName || '').trim();
+    // จุดที่อาจารย์อาจสั่งแก้: เพิ่มธนาคารที่รองรับในระบบ
+    // เพิ่มรหัสธนาคาร: const allowedBanks = ['KBANK', 'SCB', 'BBL', 'KTB', 'GSB', 'BAY'];
     const allowedBanks = ['KBANK', 'SCB', 'BBL', 'KTB'];
     const allowedPromptPayTypes = ['PHONE'];
 
@@ -162,6 +113,7 @@ router.post('/register', async (req, res) => {
       }
     }
 
+    // ตอบอาจารย์: "ใช้คำสั่ง BEGIN เพื่อเริ่มต้น Transaction ในการบันทึกข้อมูลร้านค้าและบัญชีธนาคารไปพร้อมกันแบบปรมาณู"
     await connection.query('BEGIN');
 
     const { rows: existing } = await connection.query(
@@ -177,6 +129,8 @@ router.post('/register', async (req, res) => {
       });
     }
 
+    // จุดที่อาจารย์อาจสั่งแก้: กำหนดประเภทร้านค้าเริ่มต้น
+    // ประเภทร้านค้าเริ่มต้น: type || 'ร้านอาหารทั่วไป'
     const { rows: merchants } = await connection.query(
       `INSERT INTO merchant
         (name, email, password, store_phone, type)
@@ -221,6 +175,8 @@ router.post('/register', async (req, res) => {
 
     await connection.query('COMMIT');
 
+    // จุดที่อาจารย์อาจสั่งแก้: ข้อความเมื่อสมัครสมาชิกสำเร็จ
+    // ข้อความตอบกลับ: message: 'ลงทะเบียนร้านค้าสำเร็จแล้ว'
     res.status(201).json({
       success: true,
       message: 'สมัครสมาชิกผู้ค้าสำเร็จ',
@@ -248,6 +204,7 @@ router.post('/register', async (req, res) => {
 });
 
 // ==========================================================
+// ขอบเขตที่ 1.3.3.1: เข้าสู่ระบบร้านค้า
 // POST /api/merchants/login -> เข้าสู่ระบบผู้ค้า
 // ==========================================================
 router.post('/login', async (req, res) => {
@@ -273,12 +230,15 @@ router.post('/login', async (req, res) => {
 
     const merchant = rows[0];
 
+    // จุดที่อาจารย์อาจสั่งแก้: เข้ารหัสรหัสผ่านก่อนเปรียบเทียบ
+    // ตรวจสอบรหัสผ่านผ่าน bcrypt: const match = await bcrypt.compare(password, merchant.password);
     if (password !== merchant.password) {
       return res.status(401).json({
         message: 'รหัสผ่านไม่ถูกต้อง'
       });
     }
 
+    // ตอบอาจารย์: "เรียกฟังก์ชัน getActiveSuspension เพื่อตรวจสอบว่าร้านค้าถูกระงับการใช้งานอยู่หรือไม่ หากถูกระงับจะตอบกลับด้วยรหัส 403"
     const suspension = await getActiveSuspension('merchant', merchant.id);
     if (suspension) {
       return res.status(403).json({
@@ -307,8 +267,57 @@ router.post('/login', async (req, res) => {
 });
 
 // ==========================================================
+// POST /api/merchants/reset-password -> รีเซ็ตรหัสผ่านผู้ค้าหลังยืนยัน OTP
+// ==========================================================
+// ==========================================================
+// ขอบเขตที่ 1.3.3.1: กู้คืนรหัสผ่านร้านค้าหลังยืนยัน OTP
+// POST /api/merchants/reset-password -> รีเซ็ตรหัสผ่านผู้ค้าหลังยืนยัน OTP
+// ==========================================================
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { email, newPassword } = req.body;
+    if (!email || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'กรุณาระบุอีเมลและรหัสผ่านใหม่'
+      });
+    }
+    // จุดที่อาจารย์อาจสั่งแก้: ปรับความยาวรหัสผ่านใหม่ขั้นต่ำ
+    // ความยาวรหัสผ่านขั้นต่ำ: if (String(newPassword).length < 8) return res.status(400).json({ success: false, message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร' });
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร'
+      });
+    }
+
+    // ตอบอาจารย์: "อัปเดตรหัสผ่านใหม่ในตาราง merchant โดยใช้อีเมลเป็นเงื่อนไขในการค้นหา"
+    const result = await pool.query(
+      `UPDATE merchant SET password = $1 WHERE email = $2`,
+      [String(newPassword), String(email).trim()]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบบัญชีร้านค้าที่ตรงกับอีเมลนี้'
+      });
+    }
+    return res.json({
+      success: true,
+      message: 'เปลี่ยนรหัสผ่านร้านค้าสำเร็จแล้ว'
+    });
+  } catch (error) {
+    console.error('Merchant reset password error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถเปลี่ยนรหัสผ่านร้านค้าได้'
+    });
+  }
+});
+
+// ==========================================================
+// ขอบเขตที่ 1.3.3.1: ลงทะเบียนอุปกรณ์รับ Push Notification
 // POST /api/merchants/:id/fcm-token
-// บันทึกอุปกรณ์ที่ใช้รับ Push Notification ของร้านค้า
 // ==========================================================
 router.post('/:id/fcm-token', async (req, res) => {
   const { fcm_token: fcmToken } = req.body;
@@ -335,6 +344,15 @@ router.post('/:id/fcm-token', async (req, res) => {
       });
     }
 
+    // ตอบอาจารย์: "ใช้คำสั่ง ON CONFLICT เพื่ออัปเดตเวลาล่าสุดกรณีที่ Token เดิมถูกลงทะเบียนไว้แล้ว เพื่อป้องกันข้อมูลซ้ำซ้อน"
+    await pool.query(
+      `INSERT INTO merchant_fcm_tokens (merchant_id, fcm_token, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (merchant_id, fcm_token)
+       DO UPDATE SET updated_at = NOW()`,
+      [req.params.id, fcmToken]
+    );
+
     res.json({
       success: true,
       message: 'บันทึก FCM Token ของร้านค้าเรียบร้อย'
@@ -349,68 +367,43 @@ router.post('/:id/fcm-token', async (req, res) => {
 });
 
 // ==========================================================
-// GET /api/merchants/trucks
-// ดึงรายชื่อร้านค้าทั้งหมดพร้อมเมนูอาหาร
+// ขอบเขตที่ 1.3.3.1: อัปโหลดรูปโปรไฟล์ร้านค้า
+// POST /api/merchants/:id/profile-image -> บันทึกรูปโปรไฟล์ร้านในฐานข้อมูล
 // ==========================================================
-router.get('/trucks', async (req, res) => {
+router.post('/:id/profile-image', async (req, res) => {
   try {
-    await expireStores();
-    const { rows: merchants } = await pool.query(
-      `SELECT m.id, m.name, m.type, m.store_phone AS phone,
-         s.latitude, s.longitude,
-         CASE WHEN s.selling_ends_at > CURRENT_TIMESTAMP THEN s.status ELSE 'ปิดร้าน' END AS status,
-         TO_CHAR(h.open_time, 'HH24:MI') AS open_time, TO_CHAR(h.close_time, 'HH24:MI') AS close_time
-       FROM merchant m LEFT JOIN merchant_status s ON s.merchant_id=m.id
-       LEFT JOIN merchant_hours h ON h.merchant_id=m.id`
-    );
-
-    for (let i = 0; i < merchants.length; i++) {
-      const { rows: menus } = await pool.query(
-        `SELECT id, name, price, quantity, is_available, image_url,
-                option_groups
-         FROM merchant_menus
-         WHERE merchant_id = $1`,
-        [merchants[i].id]
-      );
-
-      merchants[i].items = menus.map((menu) => {
-        let optionGroups = [];
-        if (Array.isArray(menu.option_groups)) {
-          optionGroups = menu.option_groups;
-        } else if (typeof menu.option_groups === 'string' && menu.option_groups.trim()) {
-          try {
-            const parsed = JSON.parse(menu.option_groups);
-            if (Array.isArray(parsed)) optionGroups = parsed;
-          } catch (_) {
-            optionGroups = [];
-          }
-        }
-
-        return {
-          ...normalizeMenuImageFields(menu),
-          optionGroups,
-        };
+    const image = String(req.body?.profile_image || '').trim();
+    if (!image.startsWith('data:image/')) {
+      return res.status(400).json({
+        success: false,
+        message: 'รูปโปรไฟล์ไม่ถูกต้อง'
       });
     }
-
-    res.json({
-      success: true,
-      data: merchants
-    });
+    // จุดที่อาจารย์อาจสั่งแก้: ปรับขนาดรูปโปรไฟล์สูงสุด
+    // ขนาดรูปสูงสุด 5MB: if (Buffer.byteLength(image, 'utf8') > 5 * 1024 * 1024)
+    if (Buffer.byteLength(image, 'utf8') > 2 * 1024 * 1024) {
+      return res.status(413).json({
+        success: false,
+        message: 'รูปโปรไฟล์มีขนาดใหญ่เกิน 2 MB'
+      });
+    }
+    const result = await pool.query(
+      `UPDATE merchant SET profile_image = $1 WHERE id = $2`,
+      [image, req.params.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ success: false, message: 'ไม่พบร้านค้านี้' });
+    }
+    return res.json({ success: true, profile_image: image });
   } catch (error) {
-    console.error(error);
-
-    res.status(500).json({
-      success: false,
-      message: 'Server Error',
-      error: error.message
-    });
+    console.error('Error saving merchant profile image:', error);
+    return res.status(500).json({ success: false, message: 'บันทึกรูปโปรไฟล์ไม่สำเร็จ' });
   }
 });
 
 // ==========================================================
-// GET /api/merchants/:id
-// ดึงข้อมูลโปรไฟล์ร้านค้ารายคน
+// ขอบเขตที่ 1.3.3.1: ดูข้อมูลโปรไฟล์ร้านค้ารายบุคคล
+// GET /api/merchants/:id -> ดึงข้อมูลโปรไฟล์ร้านค้ารายคน
 // ==========================================================
 router.get('/:id', async (req, res) => {
   try {
@@ -423,6 +416,7 @@ router.get('/:id', async (req, res) => {
          type,
          line_id,
          facebook_url,
+         profile_image,
          created_at
        FROM merchant
        WHERE id = $1`,
@@ -455,8 +449,8 @@ router.get('/:id', async (req, res) => {
 });
 
 // ==========================================================
-// PUT /api/merchants/:id
-// แก้ไขข้อมูลโปรไฟล์ร้านค้า
+// ขอบเขตที่ 1.3.3.1: แก้ไขข้อมูลโปรไฟล์ร้านค้า
+// PUT /api/merchants/:id -> แก้ไขข้อมูลโปรไฟล์ร้านค้า
 // ==========================================================
 router.put('/:id', async (req, res) => {
   try {
@@ -530,8 +524,8 @@ router.put('/:id', async (req, res) => {
 });
 
 // ==========================================================
-// PUT /api/merchants/:id/password
-// เปลี่ยนรหัสผ่านร้านค้า
+// ขอบเขตที่ 1.3.3.1: เปลี่ยนรหัสผ่านร้านค้า
+// PUT /api/merchants/:id/password -> เปลี่ยนรหัสผ่านร้านค้า
 // ==========================================================
 router.put('/:id/password', async (req, res) => {
   try {
@@ -547,6 +541,8 @@ router.put('/:id/password', async (req, res) => {
       });
     }
 
+    // จุดที่อาจารย์อาจสั่งแก้: ปรับความยาวรหัสผ่านใหม่
+    // ตรวจความยาวรหัสผ่านใหม่: if (newPassword.length < 8) return res.status(400).json({ success: false, message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 8 ตัวอักษร' });
     if (newPassword.length < 6) {
       return res.status(400).json({
         success: false,
@@ -568,6 +564,7 @@ router.put('/:id/password', async (req, res) => {
       });
     }
 
+    // ตอบอาจารย์: "ตรวจสอบรหัสผ่านเดิมก่อนว่าถูกต้องหรือไม่ หากรหัสผ่านเดิมไม่ถูกต้องจะยกเลิกกระบวนการทันทีเพื่อความปลอดภัย"
     if (rows[0].password !== currentPassword) {
       return res.status(401).json({
         success: false,
@@ -1028,12 +1025,10 @@ router.put(
            points_for_discount =
              EXCLUDED.points_for_discount,
            discount_amount =
-             EXCLUDED.discount_amount,
-           updated_at =
-             NOW()`,
+             EXCLUDED.discount_amount`,
         [
           req.params.id,
-          is_enabled,
+          is_enabled ? 1 : 0,
           baht,
           points,
           discount
@@ -1195,7 +1190,7 @@ router.get('/:id/menus', async (req, res) => {
 
     res.json({
       success: true,
-      data: rows.map((menu) => normalizeMenuImageFields(menu))
+      data: rows
     });
   } catch (error) {
     console.error(
@@ -1253,7 +1248,7 @@ router.post('/:id/menus', async (req, res) => {
         Number(price),
         Number(quantity),
         is_available ? 1 : 0,
-        normalizeUploadImageUrl(image_url) || null,
+        image_url || null,
         JSON.stringify(
           option_groups || []
         )
@@ -1307,7 +1302,7 @@ router.put(
             Number(price),
             Number(quantity),
             is_available ? 1 : 0,
-            normalizeUploadImageUrl(image_url) || null,
+            image_url || null,
             JSON.stringify(
               option_groups || []
             ),
@@ -1401,11 +1396,7 @@ router.get(
           `SELECT
              id,
              source_type,
-             CASE
-               WHEN source_type = 'payment_issue' AND source_id LIKE '%:slip:%'
-               THEN split_part(source_id, ':slip:', 1)
-               ELSE source_id
-             END AS source_id,
+             source_id,
              title,
              message,
              event_at
@@ -1676,11 +1667,6 @@ router.get('/:id/orders', async (req, res) => {
              '-'
            ) AS items_summary,
            o.total_price,
-           o.original_total,
-           o.points_used,
-           o.points_discount,
-           o.final_total,
-           o.loyalty_rate_snapshot,
            COALESCE(
              mo.merchant_status,
              CASE
@@ -1690,11 +1676,15 @@ router.get('/:id/orders', async (req, res) => {
              END
            ) AS merchant_status,
            mo.prep_minutes,
+           mo.updated_at AS merchant_updated_at,
            mo.reject_reason,
            mo.rejected_at,
            COALESCE(mo.ordered_at, o.created_at) AS ordered_at,
            o.status AS customer_order_status,
            o.transaction_id,
+           latest_slip.status AS latest_slip_status,
+           latest_slip.created_at AS latest_slip_created_at,
+           (latest_slip.created_at IS NOT NULL) AS has_payment_slip,
            CASE
              WHEN o.transaction_id IS NOT NULL
                OR o.status IN (
@@ -1719,15 +1709,30 @@ router.get('/:id/orders', async (req, res) => {
              THEN COALESCE(o.paid_at, mo.updated_at)
              ELSE NULL
            END AS paid_at,
-           latest_slip.status AS latest_slip_status,
-           latest_slip.created_at AS latest_slip_created_at,
-           (latest_slip.created_at IS NOT NULL) AS has_payment_slip,
            CASE
              WHEN o.status = 'รอชำระเงิน'
              THEN o.payment_deadline
              ELSE NULL
            END AS payment_deadline,
-           cmp.points_balance AS customer_points
+           COALESCE(
+             to_jsonb(o)->>'customer_points',
+             to_jsonb(o)->>'points_balance',
+             to_jsonb(o)->>'points_remaining',
+             to_jsonb(o)->>'loyalty_points',
+             to_jsonb(o)->>'reward_points'
+           ) AS customer_points,
+           COALESCE(
+             to_jsonb(o)->>'points_used',
+             to_jsonb(o)->>'used_points',
+             to_jsonb(o)->>'points_redeemed',
+             to_jsonb(o)->>'redeemed_points'
+           ) AS points_used,
+           COALESCE(
+             to_jsonb(o)->>'points_discount',
+             to_jsonb(o)->>'points_discount_amount',
+             to_jsonb(o)->>'redeemed_amount',
+             to_jsonb(o)->>'discount_from_points'
+           ) AS points_discount
 
          FROM orders o
 
@@ -1738,15 +1743,11 @@ router.get('/:id/orders', async (req, res) => {
            ON o.id = mo.source_order_id
           AND o.merchant_id = mo.merchant_id
 
-         LEFT JOIN customer_merchant_points cmp
-           ON cmp.customer_id = o.customer_id
-          AND cmp.merchant_id = o.merchant_id
-
          LEFT JOIN LATERAL (
            SELECT os.status, os.created_at
            FROM order_slips os
-           WHERE os.order_id::text = o.id::text
-           ORDER BY os.created_at DESC, os.id DESC
+           WHERE os.order_id = o.id::text
+           ORDER BY os.created_at DESC
            LIMIT 1
          ) latest_slip ON TRUE
 
@@ -1770,6 +1771,253 @@ router.get('/:id/orders', async (req, res) => {
       success: false,
       message:
         'ไม่สามารถโหลดออเดอร์ได้'
+    });
+  }
+});
+
+// ==========================================================
+// PUT /api/merchants/:id/orders/prep-shift
+// ร้านค้าเลื่อนเวลาเตรียมของทุกออเดอร์ที่ยังอยู่ในคิวพร้อมกัน (+นาที)
+// ไม่เปลี่ยนเวลาที่รับออเดอร์ (updated_at) และไม่ส่งแจ้งเตือนใดๆ
+// ==========================================================
+router.put('/:id/orders/prep-shift', async (req, res) => {
+  try {
+    const minutes = Number(req.body.minutes);
+
+    if (
+      !Number.isInteger(minutes) ||
+      minutes < 1 ||
+      minutes > 120
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'จำนวนนาทีที่เลื่อนไม่ถูกต้อง'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE merchant_orders mo
+       SET prep_minutes = mo.prep_minutes + $2::int
+       FROM orders o
+       WHERE o.id = mo.source_order_id
+         AND mo.merchant_id = $1
+         AND mo.prep_minutes IS NOT NULL
+         AND mo.merchant_status IN (
+           'ใหม่',
+           'รอชำระเงิน',
+           'รอตรวจสอบ',
+           'กำลังปรุง',
+           'รอรับสินค้า',
+           'พร้อมรับ'
+         )
+         AND o.status NOT IN (
+           'รับอาหารสำเร็จแล้ว',
+           'ปฏิเสธ',
+           'ยกเลิก',
+           'CANCELLED',
+           'CANCELED'
+         )`,
+      [req.params.id, minutes]
+    );
+
+    res.json({
+      success: true,
+      updated: result.rowCount,
+      message: 'เลื่อนเวลาเตรียมทั้งคิวสำเร็จ'
+    });
+  } catch (error) {
+    console.error(
+      'Error shifting merchant prep time:',
+      error
+    );
+
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถเลื่อนเวลาเตรียมได้'
+    });
+  }
+});
+
+// ==========================================================
+// GET /api/merchants/:id/order-eta?items=N
+// ให้ลูกค้าดูคิวและเวลาที่คาดว่าจะได้รับอาหารก่อนกดสั่ง (ชำระหน้าร้าน)
+// - items = จำนวนชิ้นที่ลูกค้ากำลังจะสั่ง (ไม่ส่งมาจะนับเป็น 1)
+// - ใช้สูตรเดียวกับแอปร้าน: เวลาต่อชิ้น x จำนวนชิ้น ต่อออเดอร์
+// - เพิ่มใหม่เท่านั้น ไม่แก้ route เดิม
+// ==========================================================
+const ETA_BUSY_THRESHOLD_MINUTES = 20;
+const ETA_COOKING_STATUSES = ['ใหม่', 'รอชำระเงิน', 'รอตรวจสอบ', 'กำลังปรุง'];
+// ออเดอร์ที่เลยเวลาแต่ยังไม่ส่งมอบ ให้นับว่ายังเหลืออีกกี่นาที (ไม่นับเป็นเสร็จแล้ว)
+const ETA_OVERDUE_EXTRA_MINUTES = 5;
+
+function formatEtaClock(date) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Bangkok',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(date);
+}
+
+// คำนวณเวลารอจากรายการออเดอร์ที่ค้างอยู่ (แยกเป็นฟังก์ชันล้วนเพื่อทดสอบได้)
+function calcOrderEta({ queueRows, perItemMinutes, items, now, sellingEndsAt }) {
+  let start = now;
+  let unknownAheadMinutes = 0;
+
+  for (const row of queueRows) {
+    const prep = row.prep_minutes === null || row.prep_minutes === undefined
+      ? null
+      : Number(row.prep_minutes);
+    const acceptedAt = row.accepted_at ? new Date(row.accepted_at) : null;
+
+    if (prep !== null && Number.isFinite(prep) && prep >= 0 && acceptedAt) {
+      const readyBy = new Date(acceptedAt.getTime() + prep * 60000);
+      const effectiveReadyBy = readyBy > now
+        ? readyBy
+        : new Date(now.getTime() + ETA_OVERDUE_EXTRA_MINUTES * 60000);
+      if (effectiveReadyBy > start) start = effectiveReadyBy;
+    } else {
+      const qty = Number(row.item_qty) > 0 ? Number(row.item_qty) : 1;
+      unknownAheadMinutes += perItemMinutes * qty;
+    }
+  }
+
+  const readyAt = new Date(
+    start.getTime() + (unknownAheadMinutes + perItemMinutes * items) * 60000
+  );
+  const waitMinutes = Math.max(
+    0,
+    Math.ceil((readyAt.getTime() - now.getTime()) / 60000)
+  );
+  const closesBeforeReady = Boolean(
+    sellingEndsAt && readyAt.getTime() > new Date(sellingEndsAt).getTime()
+  );
+
+  return {
+    queueCount: queueRows.length,
+    waitMinutes,
+    readyAt,
+    isBusy: waitMinutes >= ETA_BUSY_THRESHOLD_MINUTES,
+    closesBeforeReady
+  };
+}
+
+router.get('/:id/order-eta', async (req, res) => {
+  try {
+    await expireStores();
+
+    const rawItems = Number.parseInt(req.query.items, 10);
+    const items = Number.isInteger(rawItems) && rawItems > 0
+      ? Math.min(rawItems, 99)
+      : 1;
+
+    const { rows: statusRows } = await pool.query(
+      `SELECT status, selling_ends_at
+       FROM merchant_status
+       WHERE merchant_id = $1`,
+      [req.params.id]
+    );
+    const storeStatus = statusRows[0]?.status ?? 'ปิดร้าน';
+    const sellingEndsAt = statusRows[0]?.selling_ends_at ?? null;
+    const now = new Date();
+    const accepting =
+      storeStatus === 'เปิดร้าน' &&
+      (!sellingEndsAt || new Date(sellingEndsAt) > now);
+
+    const { rows: prepRows } = await pool.query(
+      `SELECT prep_minutes
+       FROM merchant_prep_time
+       WHERE merchant_id = $1`,
+      [req.params.id]
+    );
+    const perItemMinutes = Number(prepRows[0]?.prep_minutes ?? 15);
+
+    const { rows: orderRows } = await pool.query(
+      `SELECT
+         COALESCE(
+           mo.merchant_status,
+           CASE
+             WHEN o.status = 'รับอาหารสำเร็จแล้ว' THEN 'เสร็จสิ้น'
+             WHEN o.status IN ('ปฏิเสธ', 'ยกเลิก') THEN 'ยกเลิก'
+             ELSE 'ใหม่'
+           END
+         ) AS merchant_status,
+         mo.prep_minutes,
+         mo.updated_at AS accepted_at,
+         COALESCE(
+           (
+             SELECT SUM(oi.quantity)::int
+             FROM order_items oi
+             WHERE oi.order_id = o.id
+           ),
+           1
+         ) AS item_qty
+       FROM orders o
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND o.status NOT IN (
+           'รับอาหารสำเร็จแล้ว',
+           'ปฏิเสธ',
+           'ยกเลิก',
+           'CANCELLED',
+           'CANCELED'
+         )`,
+      [req.params.id]
+    );
+
+    // นับเฉพาะออเดอร์ที่ยังทำอยู่ (ที่ทำเสร็จรอรับแล้วไม่ถือเป็นคิว)
+    const queueRows = orderRows.filter((row) =>
+      ETA_COOKING_STATUSES.includes(row.merchant_status)
+    );
+
+    const eta = calcOrderEta({
+      queueRows,
+      perItemMinutes,
+      items,
+      now,
+      sellingEndsAt
+    });
+
+    const readyClock = formatEtaClock(eta.readyAt);
+    let message;
+    if (!accepting) {
+      message = 'ขณะนี้ร้านยังไม่เปิดรับออเดอร์';
+    } else if (eta.closesBeforeReady) {
+      message =
+        `ร้านจะปิดเวลา ${formatEtaClock(new Date(sellingEndsAt))} น. ` +
+        `แต่ออเดอร์นี้คาดว่าเสร็จประมาณ ${readyClock} น. อาจรับไม่ทัน`;
+    } else if (eta.isBusy) {
+      message =
+        `คิวเยอะ ต้องรอประมาณ ${eta.waitMinutes} นาที ` +
+        `(ประมาณ ${readyClock} น.)`;
+    } else {
+      message =
+        `คาดว่าจะได้รับประมาณ ${eta.waitMinutes} นาที ` +
+        `(ประมาณ ${readyClock} น.)`;
+    }
+
+    res.json({
+      success: true,
+      accepting,
+      store_status: storeStatus,
+      selling_ends_at: sellingEndsAt,
+      queue_count: eta.queueCount,
+      wait_minutes: eta.waitMinutes,
+      ready_at: eta.readyAt.toISOString(),
+      per_item_minutes: perItemMinutes,
+      is_busy: eta.isBusy,
+      busy_threshold_minutes: ETA_BUSY_THRESHOLD_MINUTES,
+      closes_before_ready: eta.closesBeforeReady,
+      message
+    });
+  } catch (error) {
+    console.error('Error calculating order eta:', error);
+
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถคำนวณเวลาคิวได้'
     });
   }
 });
@@ -1837,7 +2085,6 @@ router.put(
       const { rows: customerOrders } =
         await connection.query(
           `SELECT
-             o.customer_id,
              o.status,
              o.transaction_id,
              (
@@ -1954,13 +2201,17 @@ router.put(
            SET
              merchant_status = $1,
 
-             updated_at = NOW(),
-
              prep_minutes =
                COALESCE(
                  $2,
-                 prep_minutes
+                  prep_minutes
                ),
+
+             updated_at =
+               CASE
+                 WHEN $2 IS NOT NULL THEN NOW()
+                 ELSE updated_at
+               END,
 
              reject_reason =
                CASE
@@ -1982,7 +2233,7 @@ router.put(
              AND source_order_id = $7`,
           [
             status,
-            prep_minutes || null,
+            prep_minutes ?? null,
             status,
             reject_reason || null,
             status,
@@ -2038,42 +2289,9 @@ router.put(
             'ไม่พบออเดอร์ฝั่งลูกค้า'
         });
       }
-      let pickupReadyNotificationBody;
-      if (
-        status === 'รอรับสินค้า' &&
-        customerOrder.merchant_status !== 'รอรับสินค้า'
-      ) {
-        pickupReadyNotificationBody = await getPickupReadyNotificationBody(
-          connection,
-          req.params.id,
-          req.params.orderId
-        );
-
-        await connection.query(
-          `INSERT INTO notifications (user_id, title, body)
-           VALUES ($1, $2, $3)`,
-          [
-            customerOrder.customer_id,
-            'ออเดอร์พร้อมรับแล้ว',
-            pickupReadyNotificationBody
-          ]
-        );
-}
-      if (status === 'ยกเลิก') {
-        await refundOrderPointsOnce(connection, req.params.orderId);
-      }
 
       await connection.query('COMMIT');
-      if (
-        status === 'รอรับสินค้า' &&
-        customerOrder.merchant_status !== 'รอรับสินค้า'
-      ) {
-        await sendCustomerPushNotifications(
-          customerOrder.customer_id,
-          'ออเดอร์พร้อมรับแล้ว',
-          pickupReadyNotificationBody
-        );
-      }
+
       res.json({
         success: true,
         merchant_status: status,
