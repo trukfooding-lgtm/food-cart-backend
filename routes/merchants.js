@@ -1902,6 +1902,100 @@ function calcOrderEta({ queueRows, perItemMinutes, items, now, sellingEndsAt }) 
   };
 }
 
+// ==========================================================
+// ช่วงเวลารับอาหาร (แบบ Shopee เช่น 20–30 นาที)
+// - เวลาเร็วสุด = เวลารอจากคิว ปัดขึ้นทีละ 5 นาที
+// - เวลาช้าสุด = เวลาเร็วสุด + 10 นาที (เผื่อร้านทำไม่ทัน)
+// ==========================================================
+const ETA_RANGE_ROUND_MINUTES = 5;
+const ETA_RANGE_WIDTH_MINUTES = 10;
+
+function calcReadyRange(waitMinutes) {
+  const minMinutes = Math.max(
+    ETA_RANGE_ROUND_MINUTES,
+    Math.ceil(Number(waitMinutes) / ETA_RANGE_ROUND_MINUTES) *
+      ETA_RANGE_ROUND_MINUTES
+  );
+  return {
+    minMinutes,
+    maxMinutes: minMinutes + ETA_RANGE_WIDTH_MINUTES
+  };
+}
+
+// คำนวณเวลาเตรียมของออเดอร์ที่ร้านรับอัตโนมัติจากคิวจริง
+// คืนค่าเป็นเวลาช้าสุดของช่วง (นาที นับจากตอนรับออเดอร์)
+// นับเฉพาะออเดอร์อื่นที่ยังทำอยู่ ออเดอร์ที่ยังไม่ได้รับนับเฉพาะที่สั่งก่อนออเดอร์นี้
+async function estimateAutoPrepMinutes(db, merchantId, orderId) {
+  const { rows: prepRows } = await db.query(
+    `SELECT prep_minutes
+     FROM merchant_prep_time
+     WHERE merchant_id = $1`,
+    [merchantId]
+  );
+  const perItemMinutes = Number(prepRows[0]?.prep_minutes ?? 15);
+
+  const { rows: itemRows } = await db.query(
+    `SELECT COALESCE(SUM(quantity), 0)::int AS item_qty
+     FROM order_items
+     WHERE order_id = $1`,
+    [orderId]
+  );
+  const items = Number(itemRows[0]?.item_qty) > 0
+    ? Number(itemRows[0].item_qty)
+    : 1;
+
+  const { rows: orderRows } = await db.query(
+    `SELECT
+       COALESCE(
+         mo.merchant_status,
+         CASE
+           WHEN o.status = 'รับอาหารสำเร็จแล้ว' THEN 'เสร็จสิ้น'
+           WHEN o.status IN ('ปฏิเสธ', 'ยกเลิก') THEN 'ยกเลิก'
+           ELSE 'ใหม่'
+         END
+       ) AS merchant_status,
+       mo.prep_minutes,
+       mo.updated_at AS accepted_at,
+       COALESCE(
+         (
+           SELECT SUM(oi.quantity)::int
+           FROM order_items oi
+           WHERE oi.order_id = o.id
+         ),
+         1
+       ) AS item_qty
+     FROM orders o
+     LEFT JOIN merchant_orders mo
+       ON mo.source_order_id = o.id
+      AND mo.merchant_id = o.merchant_id
+     WHERE o.merchant_id = $1
+       AND o.id <> $2
+       AND (mo.prep_minutes IS NOT NULL OR o.id < $2)
+       AND o.status NOT IN (
+         'รับอาหารสำเร็จแล้ว',
+         'ปฏิเสธ',
+         'ยกเลิก',
+         'CANCELLED',
+         'CANCELED'
+       )`,
+    [merchantId, orderId]
+  );
+
+  const queueRows = orderRows.filter((row) =>
+    ETA_COOKING_STATUSES.includes(row.merchant_status)
+  );
+
+  const eta = calcOrderEta({
+    queueRows,
+    perItemMinutes,
+    items,
+    now: new Date(),
+    sellingEndsAt: null
+  });
+
+  return calcReadyRange(eta.waitMinutes).maxMinutes;
+}
+
 router.get('/:id/order-eta', async (req, res) => {
   try {
     await expireStores();
@@ -1980,22 +2074,28 @@ router.get('/:id/order-eta', async (req, res) => {
       sellingEndsAt
     });
 
-    const readyClock = formatEtaClock(eta.readyAt);
+    // ช่วงเวลารับอาหาร เช่น 20–30 นาที
+    const range = calcReadyRange(eta.waitMinutes);
+    const readyMinAt = new Date(now.getTime() + range.minMinutes * 60000);
+    const readyMaxAt = new Date(now.getTime() + range.maxMinutes * 60000);
+    const rangeClock =
+      `${formatEtaClock(readyMinAt)}–${formatEtaClock(readyMaxAt)}`;
+
     let message;
     if (!accepting) {
       message = 'ขณะนี้ร้านยังไม่เปิดรับออเดอร์';
     } else if (eta.closesBeforeReady) {
       message =
         `ร้านจะปิดเวลา ${formatEtaClock(new Date(sellingEndsAt))} น. ` +
-        `แต่ออเดอร์นี้คาดว่าเสร็จประมาณ ${readyClock} น. อาจรับไม่ทัน`;
+        `แต่ออเดอร์นี้คาดว่าเสร็จประมาณ ${rangeClock} น. อาจรับไม่ทัน`;
     } else if (eta.isBusy) {
       message =
-        `คิวเยอะ ต้องรอประมาณ ${eta.waitMinutes} นาที ` +
-        `(ประมาณ ${readyClock} น.)`;
+        `คิวเยอะ อาจรอ ${range.minMinutes}–${range.maxMinutes} นาที ` +
+        `(ประมาณ ${rangeClock} น.)`;
     } else {
       message =
-        `คาดว่าจะได้รับประมาณ ${eta.waitMinutes} นาที ` +
-        `(ประมาณ ${readyClock} น.)`;
+        `คาดว่าจะได้รับใน ${range.minMinutes}–${range.maxMinutes} นาที ` +
+        `(ประมาณ ${rangeClock} น.)`;
     }
 
     res.json({
@@ -2010,6 +2110,10 @@ router.get('/:id/order-eta', async (req, res) => {
       is_busy: eta.isBusy,
       busy_threshold_minutes: ETA_BUSY_THRESHOLD_MINUTES,
       closes_before_ready: eta.closesBeforeReady,
+      min_minutes: range.minMinutes,
+      max_minutes: range.maxMinutes,
+      ready_min_at: readyMinAt.toISOString(),
+      ready_max_at: readyMaxAt.toISOString(),
       message
     });
   } catch (error) {
@@ -2194,6 +2298,30 @@ router.put(
         }
       }
 
+      // รับออเดอร์โดยไม่ระบุเวลาเตรียม (รับอัตโนมัติจากแอปร้าน)
+      // ให้ระบบคำนวณจากคิวจริงเป็นเวลาช้าสุดของช่วง เฉพาะออเดอร์ที่ยังไม่เคยมีเวลาเตรียม
+      let effectivePrepMinutes = prep_minutes ?? null;
+      if (status === 'รอชำระเงิน' && effectivePrepMinutes === null) {
+        const { rows: currentPrepRows } = await connection.query(
+          `SELECT prep_minutes
+           FROM merchant_orders
+           WHERE merchant_id = $1
+             AND source_order_id = $2`,
+          [req.params.id, req.params.orderId]
+        );
+
+        if (
+          currentPrepRows.length > 0 &&
+          currentPrepRows[0].prep_minutes === null
+        ) {
+          effectivePrepMinutes = await estimateAutoPrepMinutes(
+            connection,
+            req.params.id,
+            req.params.orderId
+          );
+        }
+      }
+
       const result =
         await connection.query(
           `UPDATE merchant_orders
@@ -2233,7 +2361,7 @@ router.put(
              AND source_order_id = $7`,
           [
             status,
-            prep_minutes ?? null,
+            effectivePrepMinutes,
             status,
             reject_reason || null,
             status,
