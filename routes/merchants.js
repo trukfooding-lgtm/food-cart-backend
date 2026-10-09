@@ -1871,7 +1871,10 @@ function calcOrderEta({ queueRows, perItemMinutes, items, now, sellingEndsAt }) 
     const acceptedAt = row.accepted_at ? new Date(row.accepted_at) : null;
 
     if (prep !== null && Number.isFinite(prep) && prep >= 0 && acceptedAt) {
-      const readyBy = new Date(acceptedAt.getTime() + prep * 60000);
+      // prep_minutes เก็บเป็นเวลาช้าสุดของช่วง (รวมเวลาเผื่อ 10 นาที)
+      // ต่อคิวจากเวลาที่คาดว่าเสร็จจริง (ไม่รวมเวลาเผื่อ) เพื่อไม่ให้เวลาเผื่อสะสมทุกคิว
+      const expectedPrep = Math.max(0, prep - ETA_RANGE_WIDTH_MINUTES);
+      const readyBy = new Date(acceptedAt.getTime() + expectedPrep * 60000);
       const effectiveReadyBy = readyBy > now
         ? readyBy
         : new Date(now.getTime() + ETA_OVERDUE_EXTRA_MINUTES * 60000);
@@ -1922,17 +1925,33 @@ function calcReadyRange(waitMinutes) {
   };
 }
 
+// เวลาต่อชิ้นที่ใช้คำนวณ ถ้าร้านตั้งไว้ 0 นาที ให้ใช้ 5 นาทีแทน
+const ETA_ZERO_PER_ITEM_FALLBACK_MINUTES = 5;
+
+function effectivePerItemMinutes(value) {
+  const minutes = Number(value ?? 15);
+  return Number.isFinite(minutes) && minutes > 0
+    ? minutes
+    : ETA_ZERO_PER_ITEM_FALLBACK_MINUTES;
+}
+
 // คำนวณเวลาเตรียมของออเดอร์ที่ร้านรับอัตโนมัติจากคิวจริง
 // คืนค่าเป็นเวลาช้าสุดของช่วง (นาที นับจากตอนรับออเดอร์)
-// นับเฉพาะออเดอร์อื่นที่ยังทำอยู่ ออเดอร์ที่ยังไม่ได้รับนับเฉพาะที่สั่งก่อนออเดอร์นี้
+// เรียงคิวตามลำดับการสั่ง (สั่งก่อนได้ก่อน) นับเฉพาะออเดอร์ที่สั่งก่อนออเดอร์นี้และยังทำอยู่
 async function estimateAutoPrepMinutes(db, merchantId, orderId) {
+  // ล็อกต่อร้าน กันออเดอร์ที่รับพร้อมกันคำนวณคิวซ้อนกัน (ปลดล็อกเองเมื่อจบ transaction)
+  await db.query(
+    'SELECT pg_advisory_xact_lock(918273, $1::int)',
+    [merchantId]
+  );
+
   const { rows: prepRows } = await db.query(
     `SELECT prep_minutes
      FROM merchant_prep_time
      WHERE merchant_id = $1`,
     [merchantId]
   );
-  const perItemMinutes = Number(prepRows[0]?.prep_minutes ?? 15);
+  const perItemMinutes = effectivePerItemMinutes(prepRows[0]?.prep_minutes);
 
   const { rows: itemRows } = await db.query(
     `SELECT COALESCE(SUM(quantity), 0)::int AS item_qty
@@ -1969,8 +1988,7 @@ async function estimateAutoPrepMinutes(db, merchantId, orderId) {
        ON mo.source_order_id = o.id
       AND mo.merchant_id = o.merchant_id
      WHERE o.merchant_id = $1
-       AND o.id <> $2
-       AND (mo.prep_minutes IS NOT NULL OR o.id < $2)
+       AND o.id < $2
        AND o.status NOT IN (
          'รับอาหารสำเร็จแล้ว',
          'ปฏิเสธ',
@@ -2024,7 +2042,7 @@ router.get('/:id/order-eta', async (req, res) => {
        WHERE merchant_id = $1`,
       [req.params.id]
     );
-    const perItemMinutes = Number(prepRows[0]?.prep_minutes ?? 15);
+    const perItemMinutes = effectivePerItemMinutes(prepRows[0]?.prep_minutes);
 
     const { rows: orderRows } = await pool.query(
       `SELECT
