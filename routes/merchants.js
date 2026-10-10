@@ -7,6 +7,11 @@ const router = express.Router();
 const { pool } = require('../config/db');
 const { installMerchantMap, expireStores } = require('../services/merchant_map');
 const { getActiveSuspension } = require('../services/account_status');
+const {
+  getOrderQueueInfo,
+  notifyOrderAccepted,
+  notifyOrderCancelledByMerchant
+} = require('../services/customer_queue_notification');
 installMerchantMap(router);
 
 // ==========================================================
@@ -1935,6 +1940,62 @@ function effectivePerItemMinutes(value) {
     : ETA_ZERO_PER_ITEM_FALLBACK_MINUTES;
 }
 
+// เวลาต่อชิ้นที่เรียนรู้จากการขายจริงของร้าน
+// - ใช้เวลาตั้งแต่รับออเดอร์จนกดส่งมอบ หารด้วยจำนวนชิ้น แล้วใช้ค่ากลาง (median)
+// - ใช้ 30 ออเดอร์ล่าสุด ต้องมีอย่างน้อย 5 ออเดอร์ ถ้าไม่ถึงใช้เวลาที่ร้านตั้งไว้ (ร้านใหม่)
+// - ไม่นับออเดอร์ที่ใช้เวลาเกิน 60 นาที และออเดอร์ที่ระบบปิดให้อัตโนมัติ
+const LEARNED_PREP_MIN_SAMPLES = 5;
+const LEARNED_PREP_MAX_SAMPLES = 30;
+const LEARNED_PREP_MAX_ORDER_MINUTES = 60;
+
+async function getPerItemMinutes(db, merchantId, configuredValue) {
+  const fallback = effectivePerItemMinutes(configuredValue);
+  try {
+    const { rows } = await db.query(
+      `SELECT
+         EXTRACT(EPOCH FROM (o.completed_at - mo.updated_at)) / 60.0 AS minutes,
+         COALESCE(
+           (
+             SELECT SUM(oi.quantity)::int
+             FROM order_items oi
+             WHERE oi.order_id = o.id
+           ),
+           1
+         ) AS item_qty
+       FROM orders o
+       JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND o.completed_at IS NOT NULL
+         AND mo.updated_at IS NOT NULL
+         AND mo.prep_minutes IS NOT NULL
+         AND o.completed_at > mo.updated_at
+         AND o.completed_at <= mo.updated_at + ($2::int * INTERVAL '1 minute')
+         AND o.completed_at < mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
+       ORDER BY o.completed_at DESC
+       LIMIT $3`,
+      [merchantId, LEARNED_PREP_MAX_ORDER_MINUTES, LEARNED_PREP_MAX_SAMPLES]
+    );
+
+    const samples = rows
+      .map((row) => Number(row.minutes) / Math.max(1, Number(row.item_qty) || 1))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+
+    if (samples.length < LEARNED_PREP_MIN_SAMPLES) return fallback;
+
+    const middle = Math.floor(samples.length / 2);
+    const median = samples.length % 2
+      ? samples[middle]
+      : (samples[middle - 1] + samples[middle]) / 2;
+    return Math.max(1, Math.round(median));
+  } catch (error) {
+    console.error('Error learning prep time:', error.message);
+    return fallback;
+  }
+}
+
 // คำนวณเวลาเตรียมของออเดอร์ที่ร้านรับอัตโนมัติจากคิวจริง
 // คืนค่าเป็นเวลาช้าสุดของช่วง (นาที นับจากตอนรับออเดอร์)
 // เรียงคิวตามลำดับการสั่ง (สั่งก่อนได้ก่อน) นับเฉพาะออเดอร์ที่สั่งก่อนออเดอร์นี้และยังทำอยู่
@@ -1951,7 +2012,11 @@ async function estimateAutoPrepMinutes(db, merchantId, orderId) {
      WHERE merchant_id = $1`,
     [merchantId]
   );
-  const perItemMinutes = effectivePerItemMinutes(prepRows[0]?.prep_minutes);
+  const perItemMinutes = await getPerItemMinutes(
+    db,
+    merchantId,
+    prepRows[0]?.prep_minutes
+  );
 
   const { rows: itemRows } = await db.query(
     `SELECT COALESCE(SUM(quantity), 0)::int AS item_qty
@@ -2042,7 +2107,11 @@ router.get('/:id/order-eta', async (req, res) => {
        WHERE merchant_id = $1`,
       [req.params.id]
     );
-    const perItemMinutes = effectivePerItemMinutes(prepRows[0]?.prep_minutes);
+    const perItemMinutes = await getPerItemMinutes(
+      pool,
+      req.params.id,
+      prepRows[0]?.prep_minutes
+    );
 
     const { rows: orderRows } = await pool.query(
       `SELECT
@@ -2141,6 +2210,141 @@ router.get('/:id/order-eta', async (req, res) => {
       success: false,
       message: 'ไม่สามารถคำนวณเวลาคิวได้'
     });
+  }
+});
+
+// ==========================================================
+// GET /api/merchants/:id/orders/:orderId/queue
+// คิวของออเดอร์สำหรับลูกค้า: คิวที่ / เหลืออีกกี่คิว / ช่วงเวลาพร้อมรับ
+// ==========================================================
+router.get('/:id/orders/:orderId/queue', async (req, res) => {
+  try {
+    const info = await getOrderQueueInfo(pool, req.params.id, req.params.orderId);
+    res.json({
+      success: true,
+      in_queue: info.inQueue,
+      queue_number: info.queueNumber ?? null,
+      orders_ahead: info.ordersAhead ?? null,
+      queue_count: info.queueCount,
+      ready_min_at: info.readyMinAt ? info.readyMinAt.toISOString() : null,
+      ready_max_at: info.readyMaxAt ? info.readyMaxAt.toISOString() : null
+    });
+  } catch (error) {
+    console.error('Error fetching order queue:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถโหลดคิวได้'
+    });
+  }
+});
+
+// ออเดอร์ที่ยังค้างอยู่ของร้าน (ยังไม่ส่งมอบและไม่ถูกยกเลิก)
+const ACTIVE_ORDER_CLOSED_STATUSES = [
+  'รับอาหารสำเร็จแล้ว',
+  'ปฏิเสธ',
+  'ยกเลิก',
+  'CANCELLED',
+  'CANCELED'
+];
+
+// ==========================================================
+// GET /api/merchants/:id/orders/active-count
+// จำนวนออเดอร์ที่ยังค้าง ใช้ถามร้านก่อนปิดร้านหรือย้ายร้าน
+// ==========================================================
+router.get('/:id/orders/active-count', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM orders o
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND o.status <> ALL($2::text[])
+         AND COALESCE(mo.merchant_status, 'ใหม่') NOT IN ('เสร็จสิ้น', 'ยกเลิก')`,
+      [req.params.id, ACTIVE_ORDER_CLOSED_STATUSES]
+    );
+    res.json({ success: true, count: rows[0]?.count ?? 0 });
+  } catch (error) {
+    console.error('Error counting active orders:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถโหลดจำนวนออเดอร์ได้'
+    });
+  }
+});
+
+// ==========================================================
+// POST /api/merchants/:id/orders/cancel-active
+// ร้านมีเหตุขัดข้อง: ยกเลิกออเดอร์ที่ค้างทั้งหมด และแจ้งลูกค้าทุกคน
+// ==========================================================
+router.post('/:id/orders/cancel-active', async (req, res) => {
+  const reason =
+    String(req.body?.reason || '').trim() || 'ร้านมีเหตุขัดข้อง';
+  let connection;
+
+  try {
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+
+    const { rows: activeOrders } = await connection.query(
+      `SELECT o.id, o.customer_id
+       FROM orders o
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND o.status <> ALL($2::text[])
+         AND COALESCE(mo.merchant_status, 'ใหม่') NOT IN ('เสร็จสิ้น', 'ยกเลิก')
+       FOR UPDATE OF o`,
+      [req.params.id, ACTIVE_ORDER_CLOSED_STATUSES]
+    );
+
+    const orderIds = activeOrders.map((row) => row.id);
+
+    if (orderIds.length > 0) {
+      await connection.query(
+        `UPDATE merchant_orders
+         SET merchant_status = 'ยกเลิก',
+             reject_reason = $3,
+             rejected_at = NOW()
+         WHERE merchant_id = $1
+           AND source_order_id = ANY($2::int[])`,
+        [req.params.id, orderIds, reason]
+      );
+
+      await connection.query(
+        `UPDATE orders
+         SET status = 'ยกเลิก',
+             updated_at = NOW()
+         WHERE merchant_id = $1
+           AND id = ANY($2::int[])`,
+        [req.params.id, orderIds]
+      );
+    }
+
+    await connection.query('COMMIT');
+
+    for (const order of activeOrders) {
+      notifyOrderCancelledByMerchant(order.customer_id, order.id, reason);
+    }
+
+    res.json({
+      success: true,
+      cancelled: orderIds.length,
+      message: `ยกเลิกออเดอร์ที่ค้าง ${orderIds.length} รายการแล้ว`
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.query('ROLLBACK');
+    }
+    console.error('Error cancelling active orders:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถยกเลิกออเดอร์ได้'
+    });
+  } finally {
+    connection?.release();
   }
 });
 
@@ -2319,6 +2523,7 @@ router.put(
       // รับออเดอร์โดยไม่ระบุเวลาเตรียม (รับอัตโนมัติจากแอปร้าน)
       // ให้ระบบคำนวณจากคิวจริงเป็นเวลาช้าสุดของช่วง เฉพาะออเดอร์ที่ยังไม่เคยมีเวลาเตรียม
       let effectivePrepMinutes = prep_minutes ?? null;
+      let autoAccepted = false;
       if (status === 'รอชำระเงิน' && effectivePrepMinutes === null) {
         const { rows: currentPrepRows } = await connection.query(
           `SELECT prep_minutes
@@ -2337,6 +2542,7 @@ router.put(
             req.params.id,
             req.params.orderId
           );
+          autoAccepted = true;
         }
       }
 
@@ -2437,6 +2643,11 @@ router.put(
       }
 
       await connection.query('COMMIT');
+
+      // แจ้งลูกค้าว่าร้านรับออเดอร์แล้ว พร้อมคิวและช่วงเวลา (ทำงานเบื้องหลัง ไม่รอผล)
+      if (autoAccepted) {
+        notifyOrderAccepted(req.params.id, req.params.orderId);
+      }
 
       res.json({
         success: true,

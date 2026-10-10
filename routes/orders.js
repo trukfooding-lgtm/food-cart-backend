@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require('../config/db');
 const { sendMerchantNotification } = require('../services/merchant_push_notification');
 const { uploadMenuImage } = require('../services/menuImageStorageService');
+const { notifyQueueAfterCompletion } = require('../services/customer_queue_notification');
 
 // ==========================================================
 // Setup Firebase Admin
@@ -753,7 +754,8 @@ router.put(
 
  const result = await connection.query(
  `UPDATE orders
- SET status = 'รับอาหารสำเร็จแล้ว'
+ SET status = 'รับอาหารสำเร็จแล้ว',
+ completed_at = COALESCE(completed_at, NOW())
  WHERE id = $1`,
  [orderId]
  );
@@ -776,6 +778,9 @@ router.put(
  'รับอาหารสำเร็จแล้ว',
  `ออเดอร์ #${orderId} ขอบคุณที่ใช้บริการ ขอให้อร่อยกับมื้ออาหาร`
  );
+
+ // แจ้งลูกค้าคิวถัดไปว่าใกล้ถึงคิวแล้ว (ทำงานเบื้องหลัง ไม่รอผล)
+ notifyQueueAfterCompletion(orderRows[0].merchant_id);
 
  await sendMerchantNotification({
  merchantId: orderRows[0].merchant_id,
