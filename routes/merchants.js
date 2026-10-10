@@ -2771,10 +2771,10 @@ router.get('/:id/top-menus', async (req, res) => {
   try {
     const period = req.query.period === 'week' ? 'week' : 'today';
     const dateCondition = period === 'week'
-      ? `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))
-           >= DATE_TRUNC('week', CURRENT_DATE)::date`
-      : `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))
-           = CURRENT_DATE`;
+      ? `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok')
+           >= DATE_TRUNC('week', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date`
+      : `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok')
+           = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`;
 
     const { rows } = await pool.query(
       `SELECT
@@ -2844,7 +2844,7 @@ router.get(
 
          SELECT
            mo.merchant_id,
-           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at)),
+           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok'),
            COUNT(*),
            SUM(COALESCE(mo.total_price, o.total_price))
 
@@ -2874,7 +2874,7 @@ router.get(
 
          GROUP BY
            mo.merchant_id,
-           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))`,
+           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok')`,
         [req.params.id]
       );
 
@@ -2890,7 +2890,7 @@ router.get(
 
          WHERE merchant_id = $1
            AND sale_date >=
-             CURRENT_DATE -
+             (NOW() AT TIME ZONE 'Asia/Bangkok')::date -
              INTERVAL '6 days'
 
          ORDER BY sale_date`,
@@ -2919,37 +2919,37 @@ router.get(
         `SELECT
            COALESCE(
              SUM(total_orders) FILTER (
-               WHERE sale_date = CURRENT_DATE
+               WHERE sale_date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
              ),
              0
            )::int AS today_orders,
            COALESCE(
              SUM(total_sales) FILTER (
-               WHERE sale_date = CURRENT_DATE
+               WHERE sale_date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
              ),
              0
            ) AS today_sales,
            COALESCE(
              SUM(total_orders) FILTER (
-               WHERE sale_date >= DATE_TRUNC('week', CURRENT_DATE)::date
+               WHERE sale_date >= DATE_TRUNC('week', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date
              ),
              0
            )::int AS week_orders,
            COALESCE(
              SUM(total_sales) FILTER (
-               WHERE sale_date >= DATE_TRUNC('week', CURRENT_DATE)::date
+               WHERE sale_date >= DATE_TRUNC('week', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date
              ),
              0
            ) AS week_sales,
            COALESCE(
              SUM(total_orders) FILTER (
-               WHERE sale_date >= DATE_TRUNC('year', CURRENT_DATE)::date
+               WHERE sale_date >= DATE_TRUNC('year', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date
              ),
              0
            )::int AS year_orders,
            COALESCE(
              SUM(total_sales) FILTER (
-               WHERE sale_date >= DATE_TRUNC('year', CURRENT_DATE)::date
+               WHERE sale_date >= DATE_TRUNC('year', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date
              ),
              0
            ) AS year_sales
