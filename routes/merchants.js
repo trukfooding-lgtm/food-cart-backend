@@ -1890,13 +1890,13 @@ function calcOrderEta({ queueRows, perItemMinutes, items, now, sellingEndsAt }) 
         : new Date(now.getTime() + ETA_OVERDUE_EXTRA_MINUTES * 60000);
       if (effectiveReadyBy > start) start = effectiveReadyBy;
     } else {
-      const qty = Number(row.item_qty) > 0 ? Number(row.item_qty) : 1;
-      unknownAheadMinutes += perItemMinutes * qty;
+      // เวลาต่อออเดอร์: ไม่คูณตามจำนวนชิ้น
+      unknownAheadMinutes += perItemMinutes;
     }
   }
 
   const readyAt = new Date(
-    start.getTime() + (unknownAheadMinutes + perItemMinutes * items) * 60000
+    start.getTime() + (unknownAheadMinutes + perItemMinutes) * 60000
   );
   const waitMinutes = Math.max(
     0,
