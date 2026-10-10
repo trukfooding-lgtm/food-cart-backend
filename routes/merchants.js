@@ -2676,6 +2676,54 @@ router.put(
 );
 
 // ==========================================================
+// GET /api/merchants/:id/top-menus?period=today|week
+// เมนูขายดี 5 อันดับ นับจากออเดอร์ที่ส่งมอบแล้ว (ไม่นับที่ยกเลิก)
+// ==========================================================
+router.get('/:id/top-menus', async (req, res) => {
+  try {
+    const period = req.query.period === 'week' ? 'week' : 'today';
+    const dateCondition = period === 'week'
+      ? `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))
+           >= DATE_TRUNC('week', CURRENT_DATE)::date`
+      : `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))
+           = CURRENT_DATE`;
+
+    const { rows } = await pool.query(
+      `SELECT
+         oi.item_name AS name,
+         SUM(oi.quantity)::int AS quantity,
+         SUM(oi.quantity * oi.price) AS sales
+       FROM order_items oi
+       JOIN orders o
+         ON o.id = oi.order_id
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND (
+           o.status = 'รับอาหารสำเร็จแล้ว'
+           OR mo.merchant_status = 'เสร็จสิ้น'
+         )
+         AND COALESCE(mo.merchant_status, '') <> 'ยกเลิก'
+         AND o.status NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
+         AND ${dateCondition}
+       GROUP BY oi.item_name
+       ORDER BY quantity DESC, sales DESC
+       LIMIT 5`,
+      [req.params.id]
+    );
+
+    res.json({ success: true, period, data: rows });
+  } catch (error) {
+    console.error('Error fetching top menus:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถโหลดเมนูขายดีได้'
+    });
+  }
+});
+
+// ==========================================================
 // GET /api/merchants/:id/sales-summary
 // สรุปยอดขายฝั่งร้าน
 // ==========================================================
@@ -2700,9 +2748,9 @@ router.get(
 
          SELECT
            mo.merchant_id,
-           DATE(COALESCE(o.paid_at, mo.updated_at, mo.ordered_at)),
+           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at)),
            COUNT(*),
-           SUM(ROUND(mo.total_price * 0.98, 2))
+           SUM(COALESCE(mo.total_price, o.total_price))
 
          FROM merchant_orders mo
 
@@ -2712,19 +2760,17 @@ router.get(
 
          WHERE mo.merchant_id = $1
 
-           AND o.transaction_id IS NOT NULL
-           AND o.paid_at IS NOT NULL
-
-           AND mo.merchant_status IN (
-             'กำลังปรุง',
-             'ชำระเงินแล้ว',
-             'รอรับสินค้า',
-             'เสร็จสิ้น'
+           -- ชำระเงินหน้าร้าน: นับเฉพาะออเดอร์ที่ร้านกดส่งมอบแล้ว ไม่นับที่ยกเลิก และไม่หักค่าคอม
+           AND (
+             o.status = 'รับอาหารสำเร็จแล้ว'
+             OR mo.merchant_status = 'เสร็จสิ้น'
            )
+           AND mo.merchant_status <> 'ยกเลิก'
+           AND COALESCE(o.status, '') NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
 
          GROUP BY
            mo.merchant_id,
-           DATE(COALESCE(o.paid_at, mo.updated_at, mo.ordered_at))`,
+           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at))`,
         [req.params.id]
       );
 
