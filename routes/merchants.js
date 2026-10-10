@@ -721,10 +721,15 @@ router.get('/:id/prep-time', async (req, res) => {
       [req.params.id]
     );
 
+    const storedMinutes = rows[0]?.prep_minutes;
     res.json({
       success: true,
       prepMinutes:
-        rows[0]?.prep_minutes ?? 15
+        rows[0]?.prep_minutes ?? 15,
+      // true = ร้านตั้งเวลาเอง, false = ใช้เวลาที่ระบบตั้งให้
+      is_custom: Number(storedMinutes) > 0,
+      // เวลาต่อชิ้นที่ระบบใช้คำนวณคิวจริง
+      effective_minutes: effectivePerItemMinutes(storedMinutes)
     });
   } catch (error) {
     console.error(
@@ -1940,60 +1945,11 @@ function effectivePerItemMinutes(value) {
     : ETA_ZERO_PER_ITEM_FALLBACK_MINUTES;
 }
 
-// เวลาต่อชิ้นที่เรียนรู้จากการขายจริงของร้าน
-// - ใช้เวลาตั้งแต่รับออเดอร์จนกดส่งมอบ หารด้วยจำนวนชิ้น แล้วใช้ค่ากลาง (median)
-// - ใช้ 30 ออเดอร์ล่าสุด ต้องมีอย่างน้อย 5 ออเดอร์ ถ้าไม่ถึงใช้เวลาที่ร้านตั้งไว้ (ร้านใหม่)
-// - ไม่นับออเดอร์ที่ใช้เวลาเกิน 60 นาที และออเดอร์ที่ระบบปิดให้อัตโนมัติ
-const LEARNED_PREP_MIN_SAMPLES = 5;
-const LEARNED_PREP_MAX_SAMPLES = 30;
-const LEARNED_PREP_MAX_ORDER_MINUTES = 60;
-
+// เวลาต่อชิ้นที่ใช้คำนวณคิว (ตามกรณีร้าน)
+// - ร้านตั้งเวลาไว้แล้ว: ใช้เวลาที่ร้านตั้ง
+// - ร้านยังไม่ได้ตั้ง: ใช้เวลามาตรฐานของระบบ
 async function getPerItemMinutes(db, merchantId, configuredValue) {
-  const fallback = effectivePerItemMinutes(configuredValue);
-  try {
-    const { rows } = await db.query(
-      `SELECT
-         EXTRACT(EPOCH FROM (o.completed_at - mo.updated_at)) / 60.0 AS minutes,
-         COALESCE(
-           (
-             SELECT SUM(oi.quantity)::int
-             FROM order_items oi
-             WHERE oi.order_id = o.id
-           ),
-           1
-         ) AS item_qty
-       FROM orders o
-       JOIN merchant_orders mo
-         ON mo.source_order_id = o.id
-        AND mo.merchant_id = o.merchant_id
-       WHERE o.merchant_id = $1
-         AND o.completed_at IS NOT NULL
-         AND mo.updated_at IS NOT NULL
-         AND mo.prep_minutes IS NOT NULL
-         AND o.completed_at > mo.updated_at
-         AND o.completed_at <= mo.updated_at + ($2::int * INTERVAL '1 minute')
-         AND o.completed_at < mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
-       ORDER BY o.completed_at DESC
-       LIMIT $3`,
-      [merchantId, LEARNED_PREP_MAX_ORDER_MINUTES, LEARNED_PREP_MAX_SAMPLES]
-    );
-
-    const samples = rows
-      .map((row) => Number(row.minutes) / Math.max(1, Number(row.item_qty) || 1))
-      .filter((value) => Number.isFinite(value) && value > 0)
-      .sort((a, b) => a - b);
-
-    if (samples.length < LEARNED_PREP_MIN_SAMPLES) return fallback;
-
-    const middle = Math.floor(samples.length / 2);
-    const median = samples.length % 2
-      ? samples[middle]
-      : (samples[middle - 1] + samples[middle]) / 2;
-    return Math.max(1, Math.round(median));
-  } catch (error) {
-    console.error('Error learning prep time:', error.message);
-    return fallback;
-  }
+  return effectivePerItemMinutes(configuredValue);
 }
 
 // คำนวณเวลาเตรียมของออเดอร์ที่ร้านรับอัตโนมัติจากคิวจริง
