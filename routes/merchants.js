@@ -2350,7 +2350,8 @@ router.post('/:id/orders/:orderId/add-prep-time', async (req, res) => {
 // ==========================================================
 // POST /api/merchants/:id/orders/reject-selected
 // ปุ่มปฏิเสธ: ปฏิเสธเฉพาะออเดอร์ที่ร้านเลือก (ยังไม่ส่งมอบ) และแจ้งลูกค้าแต่ละคน
-// body: { order_ids: [325, 326], reason: 'ฝนตกหนัก/น้ำท่วม' }
+// body: { order_ids: [325, 326], reason: 'ฝนตกหนัก/น้ำท่วม', sold_out_items: ['ปูอัด'] }
+// sold_out_items (ไม่บังคับ): เมนูที่หมด จะถูกเปลี่ยนเป็นสินค้าหมดในหน้าจัดการเมนู
 // ==========================================================
 router.post('/:id/orders/reject-selected', async (req, res) => {
   const orderIds = Array.isArray(req.body?.order_ids)
@@ -2360,6 +2361,11 @@ router.post('/:id/orders/reject-selected', async (req, res) => {
     : [];
   const reason =
     String(req.body?.reason || '').trim() || 'ร้านมีเหตุขัดข้อง';
+  const soldOutItems = Array.isArray(req.body?.sold_out_items)
+    ? req.body.sold_out_items
+        .map((name) => String(name || '').trim())
+        .filter((name) => name.length > 0)
+    : [];
 
   if (orderIds.length === 0) {
     return res.status(400).json({
@@ -2408,6 +2414,17 @@ router.post('/:id/orders/reject-selected', async (req, res) => {
          WHERE merchant_id = $1
            AND id = ANY($2::int[])`,
         [req.params.id, rejectIds]
+      );
+    }
+
+    // สินค้าหมด: ปิดเมนูที่ร้านเลือก (สถานะมีของ/ของหมด เดิมของหน้าจัดการเมนู)
+    if (soldOutItems.length > 0) {
+      await connection.query(
+        `UPDATE merchant_menus
+         SET is_available = 0
+         WHERE merchant_id = $1
+           AND name = ANY($2::text[])`,
+        [req.params.id, soldOutItems]
       );
     }
 
