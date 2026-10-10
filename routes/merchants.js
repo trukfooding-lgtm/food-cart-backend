@@ -39,12 +39,8 @@ router.post('/register', async (req, res) => {
       });
     }
 
-    if (!bankAccount || typeof bankAccount !== 'object') {
-      return res.status(400).json({
-        success: false,
-        message: 'กรุณาเพิ่มบัญชีรับเงินอย่างน้อย 1 บัญชี'
-      });
-    }
+    // บัญชีรับเงินไม่บังคับแล้ว (ชำระเงินหน้าร้าน)
+    const hasBankAccount = !!bankAccount && typeof bankAccount === 'object';
 
     const {
       payment_type: paymentType = 'BANK_ACCOUNT',
@@ -54,7 +50,7 @@ router.post('/register', async (req, res) => {
       promptpay_type: promptPayType,
       promptpay_id: promptPayId,
       receiver_name: receiverName
-    } = bankAccount;
+    } = bankAccount || {};
 
     const cleanAccountName = String(accountName || '').trim();
     const cleanAccountNumber = String(accountNumber || '').trim();
@@ -65,14 +61,14 @@ router.post('/register', async (req, res) => {
     const allowedBanks = ['KBANK', 'SCB', 'BBL', 'KTB'];
     const allowedPromptPayTypes = ['PHONE'];
 
-    if (!['BANK_ACCOUNT', 'PROMPTPAY'].includes(paymentType)) {
+    if (hasBankAccount && !['BANK_ACCOUNT', 'PROMPTPAY'].includes(paymentType)) {
       return res.status(400).json({
         success: false,
         message: 'วิธีรับเงินไม่ถูกต้อง'
       });
     }
 
-    if (paymentType === 'BANK_ACCOUNT') {
+    if (hasBankAccount && paymentType === 'BANK_ACCOUNT') {
       if (!allowedBanks.includes(bankCode)) {
         return res.status(400).json({
           success: false,
@@ -93,7 +89,7 @@ router.post('/register', async (req, res) => {
           message: 'เลขบัญชีต้องเป็นตัวเลขเท่านั้น'
         });
       }
-    } else {
+    } else if (hasBankAccount) {
       if (!allowedPromptPayTypes.includes(promptPayType)) {
         return res.status(400).json({
           success: false,
@@ -152,7 +148,7 @@ router.post('/register', async (req, res) => {
 
     const merchantId = merchants[0].id;
 
-    await connection.query(
+    if (hasBankAccount) await connection.query(
       `INSERT INTO merchant_bank_accounts
         (
           merchant_id,
