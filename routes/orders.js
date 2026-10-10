@@ -465,7 +465,7 @@ router.get(
  o.loyalty_rate_snapshot,
  o.status,
  mo.merchant_status,
- o.refund_status,
+ NULL::text AS refund_status,
  o.created_at,
  mo.prep_minutes,
  mo.reject_reason,
