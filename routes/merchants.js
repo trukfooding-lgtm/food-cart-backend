@@ -2706,6 +2706,14 @@ router.get('/:id/top-menus', async (req, res) => {
          )
          AND COALESCE(mo.merchant_status, '') <> 'ยกเลิก'
          AND o.status NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
+         -- รายได้จริง: ไม่นับออเดอร์ที่ระบบปิดให้อัตโนมัติ (ร้านไม่ได้กดส่งมอบ)
+         AND COALESCE(o.completed_by, '') <> 'auto'
+         AND NOT (
+           o.completed_by IS NULL
+           AND o.completed_at IS NOT NULL
+           AND mo.prep_minutes IS NOT NULL
+           AND o.completed_at >= mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
+         )
          AND ${dateCondition}
        GROUP BY oi.item_name
        ORDER BY quantity DESC, sales DESC
@@ -2767,6 +2775,14 @@ router.get(
            )
            AND mo.merchant_status <> 'ยกเลิก'
            AND COALESCE(o.status, '') NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
+           -- รายได้จริง: ไม่นับออเดอร์ที่ระบบปิดให้อัตโนมัติ (ร้านไม่ได้กดส่งมอบ)
+           AND COALESCE(o.completed_by, '') <> 'auto'
+           AND NOT (
+             o.completed_by IS NULL
+             AND o.completed_at IS NOT NULL
+             AND mo.prep_minutes IS NOT NULL
+             AND o.completed_at >= mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
+           )
 
          GROUP BY
            mo.merchant_id,

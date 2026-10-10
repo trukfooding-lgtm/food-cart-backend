@@ -740,6 +740,10 @@ router.put(
  let connection;
  try {
  const orderId = req.params.id;
+ // ใครปิดออเดอร์: merchant = ร้านกดส่งมอบ, auto = ระบบปิดอัตโนมัติ, customer = ลูกค้ายืนยัน
+ const completedBy = ['merchant', 'auto', 'customer'].includes(req.body?.completed_by)
+ ? req.body.completed_by
+ : null;
  connection = await pool.connect();
  await connection.query('BEGIN');
 
@@ -755,9 +759,10 @@ router.put(
  const result = await connection.query(
  `UPDATE orders
  SET status = 'รับอาหารสำเร็จแล้ว',
- completed_at = COALESCE(completed_at, NOW())
+ completed_at = COALESCE(completed_at, NOW()),
+ completed_by = COALESCE(completed_by, $2)
  WHERE id = $1`,
- [orderId]
+ [orderId, completedBy]
  );
 
  if (result.rowCount === 0) {
