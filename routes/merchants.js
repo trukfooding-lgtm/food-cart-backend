@@ -1687,13 +1687,12 @@ router.get('/:id/orders', async (req, res) => {
            mo.rejected_at,
            COALESCE(mo.ordered_at, o.created_at) AS ordered_at,
            o.status AS customer_order_status,
-           o.transaction_id,
-           latest_slip.status AS latest_slip_status,
-           latest_slip.created_at AS latest_slip_created_at,
-           (latest_slip.created_at IS NOT NULL) AS has_payment_slip,
+           NULL::text AS transaction_id,
+           NULL::text AS latest_slip_status,
+           NULL::timestamp AS latest_slip_created_at,
+           FALSE AS has_payment_slip,
            CASE
-             WHEN o.transaction_id IS NOT NULL
-               OR o.status IN (
+             WHEN o.status IN (
                  'PAID',
                  'ชำระเงินแล้ว',
                  'พร้อมรับ',
@@ -1704,8 +1703,7 @@ router.get('/:id/orders', async (req, res) => {
              ELSE FALSE
            END AS is_paid,
            CASE
-             WHEN o.transaction_id IS NOT NULL
-               OR o.status IN (
+             WHEN o.status IN (
                  'PAID',
                  'ชำระเงินแล้ว',
                  'พร้อมรับ',
@@ -1748,14 +1746,6 @@ router.get('/:id/orders', async (req, res) => {
          LEFT JOIN merchant_orders mo
            ON o.id = mo.source_order_id
           AND o.merchant_id = mo.merchant_id
-
-         LEFT JOIN LATERAL (
-           SELECT os.status, os.created_at
-           FROM order_slips os
-           WHERE os.order_id = o.id::text
-           ORDER BY os.created_at DESC
-           LIMIT 1
-         ) latest_slip ON TRUE
 
          WHERE o.merchant_id = $1
 
@@ -2513,7 +2503,6 @@ router.put(
         await connection.query(
           `SELECT
              o.status,
-             o.transaction_id,
              (
                SELECT mo.merchant_status
                FROM merchant_orders mo
@@ -2540,9 +2529,6 @@ router.put(
       const customerOrder =
         customerOrders[0];
       const customerHasPaid =
-        Boolean(
-          customerOrder.transaction_id
-        ) ||
         [
           'PAID',
           'ชำระเงินแล้ว',
@@ -2565,60 +2551,6 @@ router.put(
           message:
             'ลูกค้ายังไม่ได้ชำระเงิน'
         });
-      }
-
-      if (status === 'กำลังปรุง') {
-        const { rows: latestSlips } = await connection.query(
-          `SELECT 1
-           FROM order_slips
-           WHERE order_id = $1
-           ORDER BY created_at DESC
-           LIMIT 1`,
-          [req.params.orderId]
-        );
-
-        if (latestSlips.length === 0) {
-          await connection.query('ROLLBACK');
-          return res.status(409).json({
-            success: false,
-            message: 'ยังไม่พบหลักฐานสลิปสำหรับยืนยัน'
-          });
-        }
-
-        if (merchantConfirmedPayment) {
-          await connection.query(
-            `UPDATE order_slips
-             SET status = 'VERIFIED',
-                 verified_at = COALESCE(verified_at, NOW()),
-                 validation_reason = COALESCE(validation_reason, 'ร้านค้ายืนยันรับเงินด้วยตนเอง')
-             WHERE id = (
-               SELECT id
-               FROM order_slips
-               WHERE order_id = $1
-               ORDER BY created_at DESC
-               LIMIT 1
-             )`,
-            [req.params.orderId]
-          );
-        } else {
-          const { rows: verifiedSlips } = await connection.query(
-            `SELECT 1
-             FROM order_slips
-             WHERE order_id = $1
-               AND status = 'VERIFIED'
-             ORDER BY created_at DESC
-             LIMIT 1`,
-            [req.params.orderId]
-          );
-
-          if (verifiedSlips.length === 0) {
-            await connection.query('ROLLBACK');
-            return res.status(409).json({
-              success: false,
-              message: 'ยังไม่พบสลิปที่ผ่านการตรวจสอบ'
-            });
-          }
-        }
       }
 
       // รับออเดอร์โดยไม่ระบุเวลาเตรียม (รับอัตโนมัติจากแอปร้าน)
