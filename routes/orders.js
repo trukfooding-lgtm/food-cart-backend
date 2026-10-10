@@ -1546,4 +1546,102 @@ router.post(
   }
 );
 
+// ==========================================================
+// ปิดออเดอร์อัตโนมัติ (ย้ายมาจากแอปร้านค้า ทำงานแม้ร้านปิดแอป)
+// ออเดอร์ที่เลยเวลาช้าสุดของช่วงพร้อมรับ (เวลารับออเดอร์ + เวลาเตรียม) เกิน 15 นาที
+// ปิดแบบเดียวกับ PUT /:id/complete โดย completed_by = 'auto'
+// ==========================================================
+const AUTO_COMPLETE_BUFFER_MINUTES = 15;
+const AUTO_COMPLETE_CLOSED_STATUSES = [
+ 'รับอาหารสำเร็จแล้ว',
+ 'สำเร็จ',
+ 'ปฏิเสธ',
+ 'ยกเลิก',
+ 'CANCELLED',
+ 'CANCELED'
+];
+let autoCompleteRunning = false;
+
+async function autoCompleteOverdueOrders() {
+ if (autoCompleteRunning) return;
+ autoCompleteRunning = true;
+ try {
+ const { rows: overdueOrders } = await pool.query(
+ `SELECT o.id
+ FROM orders o
+ JOIN merchant_orders mo
+ ON mo.source_order_id = o.id
+ AND mo.merchant_id = o.merchant_id
+ WHERE mo.prep_minutes IS NOT NULL
+ AND mo.merchant_status NOT IN ('ใหม่', 'เสร็จสิ้น', 'ยกเลิก')
+ AND o.status <> ALL($1::text[])
+ AND mo.updated_at + (mo.prep_minutes + $2) * INTERVAL '1 minute' <= NOW()
+ ORDER BY o.id ASC
+ LIMIT 50`,
+ [AUTO_COMPLETE_CLOSED_STATUSES, AUTO_COMPLETE_BUFFER_MINUTES]
+ );
+
+ for (const { id: orderId } of overdueOrders) {
+ let connection;
+ try {
+ connection = await pool.connect();
+ await connection.query('BEGIN');
+
+ const { rows: completedRows } = await connection.query(
+ `UPDATE orders
+ SET status = 'รับอาหารสำเร็จแล้ว',
+ completed_at = COALESCE(completed_at, NOW()),
+ completed_by = COALESCE(completed_by, 'auto')
+ WHERE id = $1
+ AND status <> ALL($2::text[])
+ RETURNING customer_id, merchant_id`,
+ [orderId, AUTO_COMPLETE_CLOSED_STATUSES]
+ );
+
+ if (completedRows.length === 0) {
+ await connection.query('ROLLBACK');
+ continue;
+ }
+
+ await awardOrderPointsOnce(connection, orderId);
+ await connection.query('COMMIT');
+
+ await sendPushNotification(
+ completedRows[0].customer_id,
+ 'รับอาหารสำเร็จแล้ว',
+ `ออเดอร์ #${orderId} ขอบคุณที่ใช้บริการ ขอให้อร่อยกับมื้ออาหาร`
+ );
+
+ notifyQueueAfterCompletion(completedRows[0].merchant_id);
+
+ await sendMerchantNotification({
+ merchantId: completedRows[0].merchant_id,
+ sourceType: 'order_completed',
+ sourceId: orderId,
+ title: 'คำสั่งซื้อเสร็จสิ้น',
+ message: `ออเดอร์ #${orderId} ลูกค้ายืนยันรับอาหารแล้ว`,
+ data: {
+ order_id: orderId,
+ completed_by: 'customer'
+ }
+ });
+ } catch (error) {
+ if (connection) {
+ await connection.query('ROLLBACK').catch(() => {});
+ }
+ console.error('Auto complete order error:', orderId, error.message);
+ } finally {
+ connection?.release();
+ }
+ }
+ } catch (error) {
+ console.error('Auto complete overdue orders error:', error.message);
+ } finally {
+ autoCompleteRunning = false;
+ }
+}
+
+setInterval(autoCompleteOverdueOrders, 60 * 1000).unref();
+setTimeout(autoCompleteOverdueOrders, 10 * 1000).unref();
+
 module.exports = router;
