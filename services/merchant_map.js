@@ -86,19 +86,7 @@ function installMerchantMap(router) {
         }
         // Moving the pin never extends the current selling session.
         if (!selling_started_at && (!previous || previous.status === 'ปิดร้าน' || !ends || new Date(ends) <= now)) {
-          const schedule = await client.query(`SELECT
-            CASE WHEN close_time > open_time THEN
-              ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date + close_time) AT TIME ZONE 'Asia/Bangkok'
-            ELSE
-              ((CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date + close_time +
-                CASE WHEN (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::time >= open_time THEN INTERVAL '1 day' ELSE INTERVAL '0 day' END)
-              AT TIME ZONE 'Asia/Bangkok' END AS ends_at
-            FROM merchant_hours WHERE merchant_id=$1`,[req.params.id]);
-          ends = schedule.rows[0]?.ends_at;
-          if (!ends || new Date(ends) <= new Date()) {
-            await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาตั้งเวลาเปิด–ปิดร้านให้ครอบคลุมเวลาขายปัจจุบัน'});
-          }
-          starts = now;
+          await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาเลือกเวลาขาย'});
         }
       } else if (status === 'กำลังย้าย' && (!previous || previous.status === 'ปิดร้าน' || !ends)) {
         await client.query('ROLLBACK'); return res.status(400).json({success:false,message:'กรุณาปักหมุดเปิดร้านก่อนเปลี่ยนเป็นกำลังย้าย'});
