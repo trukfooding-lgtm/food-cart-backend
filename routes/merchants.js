@@ -2305,6 +2305,95 @@ router.post('/:id/orders/cancel-active', async (req, res) => {
 });
 
 // ==========================================================
+// POST /api/merchants/:id/orders/reject-selected
+// ปุ่มปฏิเสธ: ปฏิเสธเฉพาะออเดอร์ที่ร้านเลือก (ยังไม่ส่งมอบ) และแจ้งลูกค้าแต่ละคน
+// body: { order_ids: [325, 326], reason: 'ฝนตกหนัก/น้ำท่วม' }
+// ==========================================================
+router.post('/:id/orders/reject-selected', async (req, res) => {
+  const orderIds = Array.isArray(req.body?.order_ids)
+    ? req.body.order_ids
+        .map((id) => Number.parseInt(id, 10))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    : [];
+  const reason =
+    String(req.body?.reason || '').trim() || 'ร้านมีเหตุขัดข้อง';
+
+  if (orderIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'กรุณาเลือกออเดอร์ที่ต้องการปฏิเสธ'
+    });
+  }
+
+  let connection;
+  try {
+    connection = await pool.connect();
+    await connection.query('BEGIN');
+
+    // เฉพาะออเดอร์ของร้านนี้ที่ยังค้างอยู่ (ยังไม่ส่งมอบและยังไม่ถูกยกเลิก)
+    const { rows: targetOrders } = await connection.query(
+      `SELECT o.id, o.customer_id
+       FROM orders o
+       LEFT JOIN merchant_orders mo
+         ON mo.source_order_id = o.id
+        AND mo.merchant_id = o.merchant_id
+       WHERE o.merchant_id = $1
+         AND o.id = ANY($2::int[])
+         AND o.status <> ALL($3::text[])
+         AND COALESCE(mo.merchant_status, 'ใหม่') NOT IN ('เสร็จสิ้น', 'ยกเลิก')
+       FOR UPDATE OF o`,
+      [req.params.id, orderIds, ACTIVE_ORDER_CLOSED_STATUSES]
+    );
+
+    const rejectIds = targetOrders.map((row) => row.id);
+
+    if (rejectIds.length > 0) {
+      await connection.query(
+        `UPDATE merchant_orders
+         SET merchant_status = 'ยกเลิก',
+             reject_reason = $3,
+             rejected_at = NOW()
+         WHERE merchant_id = $1
+           AND source_order_id = ANY($2::int[])`,
+        [req.params.id, rejectIds, reason]
+      );
+
+      await connection.query(
+        `UPDATE orders
+         SET status = 'ยกเลิก',
+             updated_at = NOW()
+         WHERE merchant_id = $1
+           AND id = ANY($2::int[])`,
+        [req.params.id, rejectIds]
+      );
+    }
+
+    await connection.query('COMMIT');
+
+    for (const order of targetOrders) {
+      notifyOrderCancelledByMerchant(order.customer_id, order.id, reason);
+    }
+
+    res.json({
+      success: true,
+      rejected: rejectIds.length,
+      message: `ปฏิเสธออเดอร์ ${rejectIds.length} รายการแล้ว`
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.query('ROLLBACK');
+    }
+    console.error('Error rejecting selected orders:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถปฏิเสธออเดอร์ได้'
+    });
+  } finally {
+    connection?.release();
+  }
+});
+
+// ==========================================================
 // PUT /api/merchants/:id/orders/:orderId/status
 // อัปเดตสถานะฝั่งร้านและลูกค้าให้ตรงกัน
 // ==========================================================
