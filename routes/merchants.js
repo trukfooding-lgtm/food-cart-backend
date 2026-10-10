@@ -2305,6 +2305,49 @@ router.post('/:id/orders/cancel-active', async (req, res) => {
 });
 
 // ==========================================================
+// POST /api/merchants/:id/orders/:orderId/add-prep-time
+// แตะเพื่อเปลี่ยน: เพิ่มเวลาส่งมอบเฉพาะออเดอร์นี้ตามจำนวนนาทีที่ร้านเลือก
+// body: { minutes: 10 }
+// ==========================================================
+router.post('/:id/orders/:orderId/add-prep-time', async (req, res) => {
+  const minutes = Number.parseInt(req.body?.minutes, 10);
+  if (!Number.isInteger(minutes) || minutes <= 0 || minutes > 1440) {
+    return res.status(400).json({
+      success: false,
+      message: 'จำนวนนาทีไม่ถูกต้อง'
+    });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE merchant_orders
+       SET prep_minutes = prep_minutes + $3::int
+       WHERE merchant_id = $1
+         AND source_order_id = $2
+         AND prep_minutes IS NOT NULL
+         AND merchant_status NOT IN ('เสร็จสิ้น', 'ยกเลิก')
+       RETURNING prep_minutes`,
+      [req.params.id, req.params.orderId, minutes]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบออเดอร์ที่ยังไม่ส่งมอบ'
+      });
+    }
+
+    res.json({ success: true, prep_minutes: rows[0].prep_minutes });
+  } catch (error) {
+    console.error('Error adding order prep time:', error);
+    res.status(500).json({
+      success: false,
+      message: 'ไม่สามารถเพิ่มเวลาได้'
+    });
+  }
+});
+
+// ==========================================================
 // POST /api/merchants/:id/orders/reject-selected
 // ปุ่มปฏิเสธ: ปฏิเสธเฉพาะออเดอร์ที่ร้านเลือก (ยังไม่ส่งมอบ) และแจ้งลูกค้าแต่ละคน
 // body: { order_ids: [325, 326], reason: 'ฝนตกหนัก/น้ำท่วม' }
