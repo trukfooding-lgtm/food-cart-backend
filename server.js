@@ -7,7 +7,6 @@ const customerRoutes = require('./routes/customers');
 const merchantRoutes = require('./routes/merchants');
 const ordersRoutes = require('./routes/orders');
 const internalAccountStatusRoutes = require('./routes/internal_account_status');
-const paymentRoutes = require('./backend_payment_module/routes/paymentRoutes');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -62,8 +61,6 @@ app.get('/', (req, res) => {
 
 app.use('/api/customers', customerRoutes);
 app.use('/api/merchants', merchantRoutes);
-// The Flutter app uploads customer slips to /api/orders/:id/payment-slip.
-app.use('/api', paymentRoutes);
 app.use('/api/orders', ordersRoutes);
 app.use('/api/internal', internalAccountStatusRoutes);
 app.post('/api/otp/send', async (req, res) => {

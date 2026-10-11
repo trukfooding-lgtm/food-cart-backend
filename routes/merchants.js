@@ -1554,10 +1554,6 @@ router.get('/:id/orders', async (req, res) => {
            mo.rejected_at,
            COALESCE(mo.ordered_at, o.created_at) AS ordered_at,
            o.status AS customer_order_status,
-           NULL::text AS transaction_id,
-           NULL::text AS latest_slip_status,
-           NULL::timestamp AS latest_slip_created_at,
-           FALSE AS has_payment_slip,
            CASE
              WHEN o.status IN (
                  'PAID',
