@@ -266,6 +266,67 @@ router.post('/:id/fcm-token', async (req, res) => {
 });
 
 // ==========================================================
+// GET /api/merchants/trucks
+// ดึงรายชื่อร้านค้าทั้งหมดพร้อมเมนูอาหาร (หน้าหลักลูกค้า)
+// ==========================================================
+router.get('/trucks', async (req, res) => {
+  try {
+    const { normalizeMenuImageFields } = require('../services/menuImageUrlService');
+    await expireStores();
+    const { rows: merchants } = await pool.query(
+      `SELECT m.id, m.name, m.type, m.store_phone AS phone,
+         s.latitude, s.longitude,
+         CASE WHEN s.selling_ends_at > CURRENT_TIMESTAMP THEN s.status ELSE 'ปิดร้าน' END AS status,
+         TO_CHAR(s.selling_started_at AT TIME ZONE 'Asia/Bangkok', 'HH24:MI') AS open_time,
+         TO_CHAR(s.selling_ends_at AT TIME ZONE 'Asia/Bangkok', 'HH24:MI') AS close_time
+       FROM merchant m LEFT JOIN merchant_status s ON s.merchant_id=m.id`
+    );
+
+    for (let i = 0; i < merchants.length; i++) {
+      const { rows: menus } = await pool.query(
+        `SELECT id, name, price, quantity, is_available, image_url,
+                option_groups
+         FROM merchant_menus
+         WHERE merchant_id = $1`,
+        [merchants[i].id]
+      );
+
+      merchants[i].items = menus.map((menu) => {
+        let optionGroups = [];
+        if (Array.isArray(menu.option_groups)) {
+          optionGroups = menu.option_groups;
+        } else if (typeof menu.option_groups === 'string' && menu.option_groups.trim()) {
+          try {
+            const parsed = JSON.parse(menu.option_groups);
+            if (Array.isArray(parsed)) optionGroups = parsed;
+          } catch (_) {
+            optionGroups = [];
+          }
+        }
+
+        return {
+          ...normalizeMenuImageFields(menu),
+          optionGroups,
+        };
+      });
+    }
+
+    res.json({
+      success: true,
+      data: merchants
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: 'Server Error',
+      error: error.message
+    });
+  }
+});
+
+// ==========================================================
 // ขอบเขตที่ 1.3.3.1: อัปโหลดรูปโปรไฟล์ร้านค้า
 // POST /api/merchants/:id/profile-image -> บันทึกรูปโปรไฟล์ร้านในฐานข้อมูล
 // ==========================================================
