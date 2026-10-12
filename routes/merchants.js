@@ -284,7 +284,7 @@ router.get('/trucks', async (req, res) => {
 
     for (let i = 0; i < merchants.length; i++) {
       const { rows: menus } = await pool.query(
-        `SELECT id, name, price, quantity, is_available, image_url,
+        `SELECT id, name, price, 0 AS quantity, is_available, image_url,
                 option_groups
          FROM merchant_menus
          WHERE merchant_id = $1`,
@@ -1051,7 +1051,7 @@ router.get('/:id/menus', async (req, res) => {
          id,
          name,
          price,
-         quantity,
+         0 AS quantity,
          is_available,
          image_url,
          option_groups
@@ -1083,7 +1083,6 @@ router.post('/:id/menus', async (req, res) => {
     const {
       name,
       price,
-      quantity,
       is_available,
       image_url,
       option_groups
@@ -1091,8 +1090,7 @@ router.post('/:id/menus', async (req, res) => {
 
     if (
       !name ||
-      Number(price) < 0 ||
-      Number(quantity) < 0
+      Number(price) < 0
     ) {
       return res.status(400).json({
         success: false,
@@ -1106,20 +1104,18 @@ router.post('/:id/menus', async (req, res) => {
           merchant_id,
           name,
           price,
-          quantity,
           is_available,
           image_url,
           option_groups
         )
        VALUES
-        ($1, $2, $3, $4, $5, $6, $7)
+        ($1, $2, $3, $4, $5, $6)
 
        RETURNING id`,
       [
         req.params.id,
         name,
         Number(price),
-        Number(quantity),
         is_available ? 1 : 0,
         image_url || null,
         JSON.stringify(
@@ -1152,7 +1148,6 @@ router.put(
       const {
         name,
         price,
-        quantity,
         is_available,
         image_url,
         option_groups
@@ -1164,16 +1159,14 @@ router.put(
            SET
              name = $1,
              price = $2,
-             quantity = $3,
-             is_available = $4,
-             image_url = $5,
-             option_groups = $6
-           WHERE id = $7
-             AND merchant_id = $8`,
+             is_available = $3,
+             image_url = $4,
+             option_groups = $5
+           WHERE id = $6
+             AND merchant_id = $7`,
           [
             name,
             Number(price),
-            Number(quantity),
             is_available ? 1 : 0,
             image_url || null,
             JSON.stringify(
