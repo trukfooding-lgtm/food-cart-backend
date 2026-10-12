@@ -2545,44 +2545,108 @@ router.put(
 // ==========================================================
 // GET /api/merchants/:id/top-menus?period=today|week
 // เมนูขายดี 5 อันดับ นับจากออเดอร์ที่ส่งมอบแล้ว (ไม่นับที่ยกเลิก)
+// เก็บผลรายวันไว้ในตาราง merchant_menu_sales
 // ==========================================================
 router.get('/:id/top-menus', async (req, res) => {
   try {
     const period = req.query.period === 'week' ? 'week' : 'today';
     const dateCondition = period === 'week'
-      ? `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok')
-           >= DATE_TRUNC('week', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date`
-      : `DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok')
-           = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`;
+      ? `sale_date >= DATE_TRUNC('week', (NOW() AT TIME ZONE 'Asia/Bangkok')::date)::date`
+      : `sale_date = (NOW() AT TIME ZONE 'Asia/Bangkok')::date`;
+
+    // สร้างข้อมูลเมนูขายดีรายวันใหม่จาก merchant_orders (เงื่อนไขเดียวกับยอดขายใน sales-summary)
+    // ยอดเงินของแต่ละเมนูแบ่งจากยอดออเดอร์จริง ผลรวมจึงตรงกับรายได้
+    await pool.query(
+      `DELETE FROM merchant_menu_sales
+       WHERE merchant_id = $1`,
+      [req.params.id]
+    );
+
+    await pool.query(
+      `INSERT INTO merchant_menu_sales
+         (merchant_id, sale_date, item_name, quantity, sales)
+       WITH done AS (
+         SELECT
+           mo.id AS row_id,
+           mo.merchant_id,
+           mo.source_order_id,
+           mo.items_summary,
+           COALESCE(mo.total_price, o.total_price, 0) AS order_total,
+           DATE(COALESCE(o.completed_at, o.paid_at, mo.updated_at, mo.ordered_at) AT TIME ZONE 'Asia/Bangkok') AS sale_date
+         FROM merchant_orders mo
+         LEFT JOIN orders o
+           ON o.id = mo.source_order_id
+          AND o.merchant_id = mo.merchant_id
+         WHERE mo.merchant_id = $1
+           AND (
+             o.status = 'รับอาหารสำเร็จแล้ว'
+             OR mo.merchant_status = 'เสร็จสิ้น'
+           )
+           AND mo.merchant_status <> 'ยกเลิก'
+           AND COALESCE(o.status, '') NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
+           AND COALESCE(o.completed_by, '') <> 'auto'
+           AND NOT (
+             o.completed_by IS NULL
+             AND o.completed_at IS NOT NULL
+             AND mo.prep_minutes IS NOT NULL
+             AND o.completed_at >= mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
+           )
+       ),
+       items AS (
+         SELECT
+           d.row_id,
+           d.merchant_id,
+           d.sale_date,
+           d.order_total,
+           TRIM(m[1]) AS item_name,
+           m[2]::int AS qty,
+           COALESCE(
+             (SELECT oi.price FROM order_items oi
+               WHERE oi.order_id = d.source_order_id AND oi.item_name = TRIM(m[1])
+               LIMIT 1),
+             (SELECT mm.price FROM merchant_menus mm
+               WHERE mm.merchant_id = d.merchant_id AND mm.name = TRIM(m[1])
+               LIMIT 1),
+             (SELECT mm.price FROM merchant_menus mm
+               WHERE mm.merchant_id = d.merchant_id AND mm.name = split_part(TRIM(m[1]), ' (', 1)
+               LIMIT 1),
+             0
+           ) AS unit_price
+         FROM done d
+         CROSS JOIN LATERAL regexp_split_to_table(COALESCE(d.items_summary, ''), ',\s*') AS part
+         CROSS JOIN LATERAL regexp_match(TRIM(part), '^(.+) x([0-9]+)$') AS m
+         WHERE m IS NOT NULL
+       ),
+       weighted AS (
+         SELECT
+           i.*,
+           CASE
+             WHEN SUM(i.qty * i.unit_price) OVER (PARTITION BY i.row_id) > 0
+               THEN i.qty * i.unit_price / SUM(i.qty * i.unit_price) OVER (PARTITION BY i.row_id)
+             ELSE i.qty::numeric / SUM(i.qty) OVER (PARTITION BY i.row_id)
+           END AS share
+         FROM items i
+       )
+       SELECT
+         merchant_id,
+         sale_date,
+         item_name,
+         SUM(qty)::int,
+         ROUND(SUM(order_total * share), 2)
+       FROM weighted
+       GROUP BY merchant_id, sale_date, item_name`,
+      [req.params.id]
+    );
 
     const { rows } = await pool.query(
       `SELECT
-         oi.item_name AS name,
-         SUM(oi.quantity)::int AS quantity,
-         SUM(oi.quantity * oi.price) AS sales
-       FROM order_items oi
-       JOIN orders o
-         ON o.id = oi.order_id
-       LEFT JOIN merchant_orders mo
-         ON mo.source_order_id = o.id
-        AND mo.merchant_id = o.merchant_id
-       WHERE o.merchant_id = $1
-         AND (
-           o.status = 'รับอาหารสำเร็จแล้ว'
-           OR mo.merchant_status = 'เสร็จสิ้น'
-         )
-         AND COALESCE(mo.merchant_status, '') <> 'ยกเลิก'
-         AND o.status NOT IN ('ปฏิเสธ', 'ยกเลิก', 'CANCELLED', 'CANCELED')
-         -- รายได้จริง: ไม่นับออเดอร์ที่ระบบปิดให้อัตโนมัติ (ร้านไม่ได้กดส่งมอบ)
-         AND COALESCE(o.completed_by, '') <> 'auto'
-         AND NOT (
-           o.completed_by IS NULL
-           AND o.completed_at IS NOT NULL
-           AND mo.prep_minutes IS NOT NULL
-           AND o.completed_at >= mo.updated_at + ((mo.prep_minutes + 14) * INTERVAL '1 minute')
-         )
+         item_name AS name,
+         SUM(quantity)::int AS quantity,
+         SUM(sales) AS sales
+       FROM merchant_menu_sales
+       WHERE merchant_id = $1
          AND ${dateCondition}
-       GROUP BY oi.item_name
+       GROUP BY item_name
        ORDER BY quantity DESC, sales DESC
        LIMIT 5`,
       [req.params.id]
